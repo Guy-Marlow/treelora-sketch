@@ -83,12 +83,20 @@ class CountSketch:
         self.sign_funcs = [generate_sign_function()  for _ in range(d)]
 
         self.cs = torch.zeros((d, w), device=device, dtype=dtype)
+        # Cached index tensor — reused across insert_vec calls of the same length
+        # to avoid repeated GPU allocations.  Lazily populated on first use.
+        self._idx_cache: torch.Tensor | None = None
+
+    def _get_indices(self, n: int) -> torch.Tensor:
+        if self._idx_cache is None or len(self._idx_cache) != n:
+            self._idx_cache = torch.arange(n, device=self.device, dtype=torch.int64)
+        return self._idx_cache
 
     def insert_vec(self, val_tensor):
         """Insert a 1-D tensor, applying per-element ±1 signs before hashing."""
         if not isinstance(val_tensor, torch.Tensor):
             return
-        indices = torch.arange(len(val_tensor), device=self.device, dtype=torch.int64)
+        indices = self._get_indices(len(val_tensor))
         for i in range(self.d):
             hashed_inds = self.hash_funcs[i](indices)
             signs       = self.sign_funcs[i](indices).to(self.dtype)
@@ -96,20 +104,24 @@ class CountSketch:
 
     def inner_product(self, other):
         """
-        Unbiased estimator of <a, b>: average of per-row dot products.
+        Unbiased estimator of <a, b>: mean of per-row dot products.
 
-        Unlike CMS (which takes the minimum), the average is unbiased for
-        CountSketch because the sign functions cancel cross-term collisions
-        in expectation.  Error std dev ≈ ||a||₂ × ||b||₂ / √(d×w).
+        The mean is unbiased (E[row_dot_i] = <a,b>) because the cross-term
+        collisions carry opposite signs that cancel in expectation (pairwise
+        independence of the sign functions).  Variance per row is
+        ||a||₂²||b||₂²/w; averaging d rows reduces it by d.
+        Error std dev ≈ ||a||₂ × ||b||₂ / √(d×w).
+
+        Note: Charikar et al. use the median for point-query estimation because
+        the median is robust to outlier rows; the mean is standard for inner
+        product estimation (AMS-sketch style) and adequate at d=8.
         """
         if not (isinstance(other, CountSketch)
                 and self.d == other.d and self.w == other.w):
             print('Sketches not compatible; returning 0.')
             return 0
-        row_dots = torch.stack([
-            torch.dot(self.cs[i], other.cs[i]) for i in range(self.d)
-        ])
-        return row_dots.mean()
+        # Element-wise product then sum across buckets per row — one fused GPU op.
+        return (self.cs * other.cs).sum(dim=1).mean()
 
     def l1_sketch_diff(self, other):
         """L1 norm of the element-wise sketch difference (same semantics as CMS version)."""
