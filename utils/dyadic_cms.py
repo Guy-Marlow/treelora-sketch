@@ -40,6 +40,85 @@ def generate_hash_function(w):
         return ((a * val + b) % BIG_MERSENNE) % width
     return hash
 
+def generate_sign_function():
+    a = random.randint(1, BIG_MERSENNE)
+    b = random.randint(0, BIG_MERSENNE)
+    def sign(val):
+        return (((a * val + b) % BIG_MERSENNE) & 1).float() * 2 - 1
+    return sign
+
+
+class CountSketch:
+    """
+    CountSketch (Charikar, Chen, Farach-Colton 2002).
+
+    Unlike CountMinSketch, this is a Johnson-Lindenstrauss projection: each
+    element is mapped to a bucket and multiplied by a random ±1 sign before
+    accumulation.  The inner product estimator is unbiased and its error scales
+    as ||a||₂ × ||b||₂ / √(d×w) — roughly √n times smaller than CMS for dense
+    vectors, where n is the vector length.
+
+    Handles signed vectors natively; no abs() required before insertion.
+
+    Parameters
+    ----------
+    d     : number of independent rows (depth)
+    w     : number of buckets per row (width)
+    device: torch device
+    dtype : torch dtype for the sketch matrix
+    seed  : RNG seed — all sketches with the same (d, w, seed) share hash/sign
+            functions and are therefore comparable under inner_product /
+            l1_sketch_diff.
+    """
+
+    def __init__(self, d, w, device, dtype, seed=0):
+        self.d      = d
+        self.w      = w
+        self.device = device
+        self.dtype  = dtype
+        self.seed   = seed
+
+        random.seed(seed)
+        self.hash_funcs = [generate_hash_function(w) for _ in range(d)]
+        self.sign_funcs = [generate_sign_function()  for _ in range(d)]
+
+        self.cs = torch.zeros((d, w), device=device, dtype=dtype)
+
+    def insert_vec(self, val_tensor):
+        """Insert a 1-D tensor, applying per-element ±1 signs before hashing."""
+        if not isinstance(val_tensor, torch.Tensor):
+            return
+        indices = torch.arange(len(val_tensor), device=self.device, dtype=torch.int64)
+        for i in range(self.d):
+            hashed_inds = self.hash_funcs[i](indices)
+            signs       = self.sign_funcs[i](indices).to(self.dtype)
+            self.cs[i].scatter_add_(0, hashed_inds, signs * val_tensor)
+
+    def inner_product(self, other):
+        """
+        Unbiased estimator of <a, b>: average of per-row dot products.
+
+        Unlike CMS (which takes the minimum), the average is unbiased for
+        CountSketch because the sign functions cancel cross-term collisions
+        in expectation.  Error std dev ≈ ||a||₂ × ||b||₂ / √(d×w).
+        """
+        if not (isinstance(other, CountSketch)
+                and self.d == other.d and self.w == other.w):
+            print('Sketches not compatible; returning 0.')
+            return 0
+        row_dots = torch.stack([
+            torch.dot(self.cs[i], other.cs[i]) for i in range(self.d)
+        ])
+        return row_dots.mean()
+
+    def l1_sketch_diff(self, other):
+        """L1 norm of the element-wise sketch difference (same semantics as CMS version)."""
+        if not (isinstance(other, CountSketch)
+                and self.d == other.d and self.w == other.w):
+            print('Sketches not compatible; returning 0.')
+            return 0
+        return torch.sum(torch.abs(self.cs - other.cs)).item()
+
 class CountMinSketch:
     def __init__(self, d, w, device, dtype, hash_funcs=None, seed=0):
         self.d = d

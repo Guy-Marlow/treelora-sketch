@@ -84,7 +84,7 @@ def _setup_logging(log_path: str):
     return tee
 
 from model.vit_lora import build_treelora_vit
-from utils.dyadic_cms import CountMinSketch
+from utils.dyadic_cms import CountMinSketch, CountSketch
 from utils.kd_lora_tree import KD_LoRA_Tree
 from utils.data.vision_cl_datasets import (
     make_split_cifar100,
@@ -220,24 +220,44 @@ class ViTCLTrainer:
         return torch.cat([(B @ A).reshape(-1) for A, B in zip(A_params, B_params)])
 
     def _init_task_sketches(self) -> dict:
-        """Create 7 fresh CountMinSketches for one task."""
-        def make():
-            return CountMinSketch(
-                self._sketch_d, self._sketch_w,
-                device=self.device, dtype=torch.float32,
-            )
-        return {
-            'cm_grad_abs':            make(),
-            'cm_grad_squared':        make(),
-            'cm_taylor':              make(),
-            'cm_weight_diff':         make(),
-            'cm_weight_diff_squared': make(),
-            'cm_state':               make(),
-            'cm_state_ab':            CountMinSketch(
-                self._sketch_d, self._sketch_w_ab,
-                device=self.device, dtype=torch.float32,
-            ),
-        }
+        """Create 7 fresh sketches for one task (CMS or CountSketch per --sketch_type)."""
+        use_cs = getattr(self.args, 'sketch_type', 'cms') == 'cs'
+        if use_cs:
+            def make():
+                return CountSketch(
+                    self._sketch_d, self._sketch_w,
+                    device=self.device, dtype=torch.float32,
+                )
+            return {
+                'cm_grad_abs':            make(),
+                'cm_grad_squared':        make(),
+                'cm_taylor':              make(),
+                'cm_weight_diff':         make(),
+                'cm_weight_diff_squared': make(),
+                'cm_state':               make(),
+                'cm_state_ab':            CountSketch(
+                    self._sketch_d, self._sketch_w_ab,
+                    device=self.device, dtype=torch.float32,
+                ),
+            }
+        else:
+            def make():
+                return CountMinSketch(
+                    self._sketch_d, self._sketch_w,
+                    device=self.device, dtype=torch.float32,
+                )
+            return {
+                'cm_grad_abs':            make(),
+                'cm_grad_squared':        make(),
+                'cm_taylor':              make(),
+                'cm_weight_diff':         make(),
+                'cm_weight_diff_squared': make(),
+                'cm_state':               make(),
+                'cm_state_ab':            CountMinSketch(
+                    self._sketch_d, self._sketch_w_ab,
+                    device=self.device, dtype=torch.float32,
+                ),
+            }
 
     # ── Single-task training ──────────────────────────────────────────────────
 
@@ -255,8 +275,16 @@ class ViTCLTrainer:
             betas=(0.9, 0.999),
         )
 
-        # Fresh set of 6 sketches for this task
-        sketches = self._init_task_sketches()
+        # Fresh set of 7 sketches for this task
+        sketches  = self._init_task_sketches()
+        use_cs    = getattr(self.args, 'sketch_type', 'cms') == 'cs'
+
+        # CountSketch: accumulate signed running sums; insert once at task end.
+        # CMS:         insert abs values per batch throughout training.
+        cs_grad_acc        = None
+        cs_taylor_acc      = None
+        cs_weight_diff_acc = None
+        cs_batch_count     = 0
 
         for epoch in range(epochs):
             self.model.train()
@@ -306,10 +334,15 @@ class ViTCLTrainer:
                     grad_flat  = self._flat_adapter_vec(use_grad=True)
                     param_flat = self._flat_adapter_vec(use_grad=False)
                     if grad_flat is not None and param_flat is not None:
-                        sketches['cm_grad_abs'].insert_vec(grad_flat.abs())
+                        if use_cs:
+                            # Accumulate signed quantities; insert at task end.
+                            cs_grad_acc   = grad_flat        if cs_grad_acc   is None else cs_grad_acc   + grad_flat
+                            cs_taylor_acc = grad_flat * param_flat if cs_taylor_acc is None else cs_taylor_acc + grad_flat * param_flat
+                        else:
+                            sketches['cm_grad_abs'].insert_vec(grad_flat.abs())
+                            sketches['cm_taylor'].insert_vec((grad_flat * param_flat).abs())
+                        # Squared quantities are always positive — insert per-batch for both paths.
                         sketches['cm_grad_squared'].insert_vec(grad_flat ** 2)
-                        sketches['cm_taylor'].insert_vec((grad_flat * param_flat).abs())
-                        # param_flat is already a fresh cat-allocated tensor; safe as pre_step
                         pre_step = param_flat
 
                 optimizer.step()
@@ -318,8 +351,14 @@ class ViTCLTrainer:
                     if pre_step is not None:
                         post_flat = self._flat_adapter_vec(use_grad=False)
                         diff = post_flat - pre_step
-                        sketches['cm_weight_diff'].insert_vec(diff.abs())
+                        if use_cs:
+                            cs_weight_diff_acc = diff if cs_weight_diff_acc is None else cs_weight_diff_acc + diff
+                        else:
+                            sketches['cm_weight_diff'].insert_vec(diff.abs())
                         sketches['cm_weight_diff_squared'].insert_vec(diff ** 2)
+
+                if use_cs and grad_flat is not None:
+                    cs_batch_count += 1
                 # ── End per-batch sketch updates ─────────────────────────────
 
                 with torch.no_grad():
@@ -342,6 +381,14 @@ class ViTCLTrainer:
 
         # ── Task boundary: record final adapter state, store sketches ─────────
         with torch.no_grad():
+            # Signed accumulated quantities — insert mean for CountSketch path.
+            if use_cs and cs_batch_count > 0:
+                sketches['cm_grad_abs'].insert_vec(cs_grad_acc / cs_batch_count)
+                sketches['cm_taylor'].insert_vec(cs_taylor_acc / cs_batch_count)
+                sketches['cm_weight_diff'].insert_vec(cs_weight_diff_acc / cs_batch_count)
+
+            # State snapshots use abs() for both paths: direction is not meaningful
+            # for a final-position comparison, only magnitude is.
             state_flat = self._flat_adapter_vec(use_grad=False)
             if state_flat is not None:
                 sketches['cm_state'].insert_vec(state_flat.abs())
@@ -495,13 +542,14 @@ class ViTCLTrainer:
         Backward-transfer pairs sit at the low end of the forgetting spectrum and
         provide additional support for the same relationship.
 
-        Table layout  (13 rows × n_pairs columns):
+        Table layout  (15 rows × n_pairs columns):
             row  0          : forgetting = acc_matrix[t',t'] - acc_matrix[t,t']
             rows 1,3,5,...  : inner_product(sketch_t, sketch_t')   per sketch
             rows 2,4,6,...  : l1_sketch_diff(sketch_t, sketch_t')  per sketch
 
         Sketch order: cm_grad_abs, cm_grad_squared, cm_taylor,
-                      cm_weight_diff, cm_weight_diff_squared, cm_state
+                      cm_weight_diff, cm_weight_diff_squared, cm_state,
+                      cm_state_ab
 
         Kendall's tau is computed between the forgetting row and every metric
         row when at least 3 pairs are available.
@@ -623,6 +671,11 @@ def parse_args():
     p.add_argument('--lr', type=float, default=0.005,
                    help='Learning rate — constant, no decay (paper: 0.005)')
     p.add_argument('--num_workers', type=int, default=4)
+
+    # Sketch algorithm
+    p.add_argument('--sketch_type', choices=['cms', 'cs'], default='cms',
+                   help='cms = CountMinSketch (per-batch abs inserts); '
+                        'cs  = CountSketch (JL projection, signed mean gradient)')
 
     # Tree regularisation
     p.add_argument('--reg', type=float, default=0.1,
