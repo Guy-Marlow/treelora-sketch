@@ -152,13 +152,14 @@ class ViTCLTrainer:
             p.numel() for n, p in self.model.named_parameters()
             if 'loranew_A' in n or 'loranew_B' in n
         )
-        self._sketch_w = math.ceil(0.05 * self._adapter_total_params)
-        self._sketch_d = 8
+        _w_frac = getattr(args, 'sketch_w_frac', 0.05)
+        self._sketch_d = getattr(args, 'sketch_d', 8)
+        self._sketch_w = math.ceil(_w_frac * self._adapter_total_params)
         # Separate width for the AB-product sketch (d_out×d_in per layer >> r×d per layer)
         _A_shapes = [p.shape for n, p in self.model.named_parameters() if 'loranew_A' in n]
         _B_shapes = [p.shape for n, p in self.model.named_parameters() if 'loranew_B' in n]
         self._ab_total_params = sum(b[0] * a[1] for a, b in zip(_A_shapes, _B_shapes))
-        self._sketch_w_ab = math.ceil(0.05 * self._ab_total_params)
+        self._sketch_w_ab = math.ceil(_w_frac * self._ab_total_params)
 
     # ── Feature extraction ────────────────────────────────────────────────────
 
@@ -387,14 +388,14 @@ class ViTCLTrainer:
                 sketches['cm_taylor'].insert_vec(cs_taylor_acc / cs_batch_count)
                 sketches['cm_weight_diff'].insert_vec(cs_weight_diff_acc / cs_batch_count)
 
-            # State snapshots use abs() for both paths: direction is not meaningful
-            # for a final-position comparison, only magnitude is.
+            # State snapshots: CMS requires abs() (non-negativity guarantee);
+            # CS accepts signed values so we preserve direction.
             state_flat = self._flat_adapter_vec(use_grad=False)
             if state_flat is not None:
-                sketches['cm_state'].insert_vec(state_flat.abs())
+                sketches['cm_state'].insert_vec(state_flat if use_cs else state_flat.abs())
             ab_flat = self._flat_ab_product_vec()
             if ab_flat is not None:
-                sketches['cm_state_ab'].insert_vec(ab_flat.abs())
+                sketches['cm_state_ab'].insert_vec(ab_flat if use_cs else ab_flat.abs())
 
         self.sketch_bank.append(sketches)
 
@@ -672,10 +673,14 @@ def parse_args():
                    help='Learning rate — constant, no decay (paper: 0.005)')
     p.add_argument('--num_workers', type=int, default=4)
 
-    # Sketch algorithm
+    # Sketch algorithm and dimensions
     p.add_argument('--sketch_type', choices=['cms', 'cs'], default='cms',
                    help='cms = CountMinSketch (per-batch abs inserts); '
                         'cs  = CountSketch (JL projection, signed mean gradient)')
+    p.add_argument('--sketch_w_frac', type=float, default=0.05,
+                   help='Sketch width as a fraction of total adapter params')
+    p.add_argument('--sketch_d', type=int, default=8,
+                   help='Sketch depth (number of independent hash rows)')
 
     # Tree regularisation
     p.add_argument('--reg', type=float, default=0.1,
@@ -707,7 +712,9 @@ def main():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         'vit_cl_logs',
     )
-    _log_path = os.path.join(_log_dir, f'vitb-16-21k-{_benchmark_slug}.log')
+    _sketch_tag = args.sketch_type if args.sketch_type != 'cms' else ''
+    _sketch_tag = f'-{_sketch_tag}' if _sketch_tag else ''
+    _log_path = os.path.join(_log_dir, f'vitb-16-21k-{_benchmark_slug}{_sketch_tag}.log')
     _tee = _setup_logging(_log_path)
     print(f'Logging to {_log_path}')
 
