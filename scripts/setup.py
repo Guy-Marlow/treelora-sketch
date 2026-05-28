@@ -75,9 +75,10 @@ _DATASET_SENTINELS = {
 def setup_datasets(data_root: str, datasets: list[str], force: bool = False):
     _section(f'Datasets  →  {data_root}')
 
-    import subprocess
+    # Import the existing downloader so we stay consistent with its logic
     script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    dl_script  = os.path.join(script_dir, 'utils', 'data', 'download_datasets.py')
+    sys.path.insert(0, script_dir)
+    from utils.data.download_datasets import download
 
     for name in datasets:
         path = os.path.join(data_root, name)
@@ -86,10 +87,7 @@ def setup_datasets(data_root: str, datasets: list[str], force: bool = False):
             print(f'  {name}: already present — skipping.')
             continue
         print(f'\n  [{name}]')
-        cmd = [sys.executable, dl_script, '--data_root', data_root, '--datasets', name]
-        if force:
-            cmd.append('--force')
-        subprocess.run(cmd, check=True)
+        download(name, data_root, force=force)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

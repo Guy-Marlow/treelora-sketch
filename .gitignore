@@ -165,7 +165,7 @@ try.py
 # ── Project-specific exclusions ───────────────────────────────────────────────
 
 # Datasets (re-download with scripts/setup.py)
-data/
+/data/
 
 # Pre-trained model checkpoints (re-download with scripts/setup.py)
 PTM/
