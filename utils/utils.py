@@ -8,8 +8,12 @@ import random
 import numpy as np
 from transformers import set_seed, AutoTokenizer
 import json
-import deepspeed
-from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+try:
+    import deepspeed
+    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+except ImportError:
+    deepspeed = None
+    ZeroParamStatus = None
 
 
 def print_rank_0(msg, rank=0):
