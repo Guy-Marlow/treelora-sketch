@@ -120,7 +120,13 @@ class CountSketch:
                 and self.d == other.d and self.w == other.w):
             print('Sketches not compatible; returning 0.')
             return 0
-        # Element-wise product then sum across buckets per row — one fused GPU op.
+        # Row-wise dot products (one fused GPU op), then mean across rows.
+        # Mean is unbiased for inner products: per-row noise is zero-mean, so
+        # averaging d rows gives 1/d variance reduction (Var = ||a||₂²||b||₂²/dw).
+        # Median is NOT used here: for inner products the per-row noise is
+        # asymmetric (heavy positive tail from same-sign collision products),
+        # which makes the median negatively biased.  Median is correct for
+        # Charikar's point-query use case where noise IS symmetric.
         return (self.cs * other.cs).sum(dim=1).mean()
 
     def l1_sketch_diff(self, other):
