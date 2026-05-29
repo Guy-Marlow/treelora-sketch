@@ -555,7 +555,7 @@ class ViTCLTrainer:
         Kendall's tau is computed between the forgetting row and every metric
         row when at least 3 pairs are available.
         """
-        from scipy.stats import kendalltau
+        from scipy.stats import kendalltau, spearmanr
 
         num_tasks = len(self.task_info)
         sketch_names = [
@@ -611,20 +611,24 @@ class ViTCLTrainer:
             vals = ''.join(f'{table[row_idx, col]:>{col_w}.4f}' for col in range(n_pairs))
             print(f'  {label:<42}{vals}')
 
-        # ── Kendall's tau ─────────────────────────────────────────────────────
+        # ── Kendall τ and Spearman ρ ──────────────────────────────────────────
         tau_results = {}
+        rho_results = {}
         if n_pairs >= 3:
             forgetting = table[0, :]
-            print(f'\n  {"Metric":<42}  {"τ":>8}  {"p-val":>8}')
-            print(f'  {"-" * 42}  {"-" * 8}  {"-" * 8}')
+            print(f'\n  {"Metric":<42}  {"τ":>8}  {"p(τ)":>8}  {"ρ":>8}  {"p(ρ)":>8}')
+            print(f'  {"-" * 42}  {"-" * 8}  {"-" * 8}  {"-" * 8}  {"-" * 8}')
             for row_idx in range(1, n_rows):
                 label = row_labels[row_idx]
-                tau, pval = kendalltau(forgetting, table[row_idx, :])
-                tau_results[label] = {'tau': float(tau), 'pval': float(pval)}
-                sig = '*' if pval < 0.05 else (' .' if pval < 0.10 else '  ')
-                print(f'  {label:<42}  {tau:>8.4f}  {pval:>8.4f} {sig}')
+                tau,  p_tau = kendalltau(forgetting, table[row_idx, :])
+                rho,  p_rho = spearmanr(forgetting,  table[row_idx, :])
+                tau_results[label] = {'tau': float(tau), 'pval': float(p_tau)}
+                rho_results[label] = {'rho': float(rho), 'pval': float(p_rho)}
+                sig_tau = '*' if p_tau < 0.05 else (' .' if p_tau < 0.10 else '  ')
+                sig_rho = '*' if p_rho < 0.05 else (' .' if p_rho < 0.10 else '  ')
+                print(f'  {label:<42}  {tau:>8.4f}  {p_tau:>8.4f}{sig_tau} {rho:>8.4f}  {p_rho:>8.4f}{sig_rho}')
         else:
-            print(f'\n  (Kendall τ requires ≥ 3 pairs; have {n_pairs} — raw values above.)')
+            print(f'\n  (rank correlations require ≥ 3 pairs; have {n_pairs} — raw values above.)')
 
         print(f'{"=" * 70}')
 
@@ -633,6 +637,7 @@ class ViTCLTrainer:
             'row_labels': row_labels,
             'pairs':      [(int(t), int(tp)) for (t, tp) in pairs],
             'tau':        tau_results,
+            'rho':        rho_results,
         }
 
 
