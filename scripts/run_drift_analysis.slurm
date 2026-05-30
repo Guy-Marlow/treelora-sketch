@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --job-name=treelora_drift
-#SBATCH --time=20:00:00
+#SBATCH --time=24:00:00
 #SBATCH --open-mode=append
 #SBATCH --output=/data/gmar762/research/continuous_learning/treelora/vit_cl_logs/drift_noreg/slurm_output.log
 #SBATCH --error=/data/gmar762/research/continuous_learning/treelora/vit_cl_logs/drift_noreg/slurm_error.log
@@ -12,19 +12,38 @@ cd /data/gmar762/research/continuous_learning/treelora/training
 source /data/gmar762/anaconda3/etc/profile.d/conda.sh
 conda activate treelora
 
-# Per-epoch drift analysis with no regularisation (reg=0 disables the tree entirely).
-# At the end of each training epoch, the model is evaluated on all prior tasks and
-# the forgetting is correlated against the ip and l1diff of the current adapter
-# sketch vs. each prior task's canonical sketch.
+python3 ../scripts/setup.py \
+    --ptm_dir  ../PTM/vit-base-patch16-224-in21k \
+    --data_root ../data
+
+# Per-epoch drift analysis across all 5 benchmarks.
+# --reg 0: no regularisation — tree is not constructed, adapter fine-tunes freely.
+# --drift_analysis: build CMS+CS sketch pairs each epoch, evaluate all prior tasks,
+#   record (forgetting, cms_ip, cms_l1diff, cs_ip, cs_l1diff) per (task, epoch,
+#   prior_task) triple. Produces both absolute and first-differences correlations.
+#
+# Note: the three ImageNet-R variants write to separate log subdirectories because
+# all three share the same benchmark slug (split-imagenet-r) and would otherwise
+# overwrite each other's log files.
 
 python3 vit_cl_train.py \
-    --model_path    ../PTM/vit-base-patch16-224-in21k \
-    --dataset       cifar100 \
-    --data_root     ../data \
-    --reg           0 \
+    --model_path ../PTM/vit-base-patch16-224-in21k \
+    --dataset    cifar100 \
+    --data_root  ../data \
+    --reg        0 \
     --drift_analysis \
-    --output_dir    ../runs/drift-noreg/split-cifar-100 \
-    --log_dir       ../vit_cl_logs/drift_noreg
+    --output_dir ../runs/drift-noreg/split-cifar-100 \
+    --log_dir    ../vit_cl_logs/drift_noreg
+
+python3 vit_cl_train.py \
+    --model_path       ../PTM/vit-base-patch16-224-in21k \
+    --dataset          imagenet_r \
+    --imagenet_r_tasks 5 \
+    --data_root        ../data \
+    --reg              0 \
+    --drift_analysis \
+    --output_dir       ../runs/drift-noreg/split-imagenet-r-5t \
+    --log_dir          ../vit_cl_logs/drift_noreg/imagenet_r_5t
 
 python3 vit_cl_train.py \
     --model_path       ../PTM/vit-base-patch16-224-in21k \
@@ -34,13 +53,23 @@ python3 vit_cl_train.py \
     --reg              0 \
     --drift_analysis \
     --output_dir       ../runs/drift-noreg/split-imagenet-r-10t \
-    --log_dir          ../vit_cl_logs/drift_noreg
+    --log_dir          ../vit_cl_logs/drift_noreg/imagenet_r_10t
 
 python3 vit_cl_train.py \
-    --model_path    ../PTM/vit-base-patch16-224-in21k \
-    --dataset       cub200 \
-    --data_root     ../data \
-    --reg           0 \
+    --model_path       ../PTM/vit-base-patch16-224-in21k \
+    --dataset          imagenet_r \
+    --imagenet_r_tasks 20 \
+    --data_root        ../data \
+    --reg              0 \
     --drift_analysis \
-    --output_dir    ../runs/drift-noreg/split-cub-200 \
-    --log_dir       ../vit_cl_logs/drift_noreg
+    --output_dir       ../runs/drift-noreg/split-imagenet-r-20t \
+    --log_dir          ../vit_cl_logs/drift_noreg/imagenet_r_20t
+
+python3 vit_cl_train.py \
+    --model_path ../PTM/vit-base-patch16-224-in21k \
+    --dataset    cub200 \
+    --data_root  ../data \
+    --reg        0 \
+    --drift_analysis \
+    --output_dir ../runs/drift-noreg/split-cub-200 \
+    --log_dir    ../vit_cl_logs/drift_noreg

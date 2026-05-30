@@ -531,6 +531,60 @@ class ViTCLTrainer:
 
         print(f'{"=" * 70}')
 
+        # ── First-differences analysis ────────────────────────────────────────
+        # Correlate epoch-to-epoch CHANGES in forgetting against epoch-to-epoch
+        # CHANGES in sketch metrics.  This removes any monotonic trend shared by
+        # both series (e.g. l1diff always increases while forgetting drifts up
+        # overall) and tests whether the rate of sketch movement genuinely tracks
+        # the rate of forgetting change — a stricter and more informative test.
+        d_forgetting, d_ip, d_l1diff, d_c_ip, d_c_l1diff = [], [], [], [], []
+
+        sorted_recs = sorted(
+            self.drift_records,
+            key=lambda r: (r['task'], r['prior_task'], r['epoch'])
+        )
+        prev = None
+        for r in sorted_recs:
+            if (prev is not None
+                    and r['task'] == prev['task']
+                    and r['prior_task'] == prev['prior_task']):
+                d_forgetting.append(r['forgetting'] - prev['forgetting'])
+                d_ip.append(        r['ip']         - prev['ip'])
+                d_l1diff.append(    r['l1diff']     - prev['l1diff'])
+                d_c_ip.append(      r['c_ip']       - prev['c_ip'])
+                d_c_l1diff.append(  r['c_l1diff']   - prev['c_l1diff'])
+            prev = r
+
+        if len(d_forgetting) >= 3:
+            d_forgetting = np.array(d_forgetting)
+            d_ip         = np.array(d_ip)
+            d_l1diff     = np.array(d_l1diff)
+            d_c_ip       = np.array(d_c_ip)
+            d_c_l1diff   = np.array(d_c_l1diff)
+            nd = len(d_forgetting)
+
+            print(f'\n{"=" * 70}')
+            print('  First-Differences Analysis (epoch-to-epoch Δ)')
+            print(f'  {nd} consecutive-epoch pairs')
+            print(f'{"=" * 70}')
+            print(f'\n  {"Metric":<25}  {"τ":>8}  {"p(τ)":>8}  {"ρ":>8}  {"p(ρ)":>8}')
+            print(f'  {"-" * 25}  {"-" * 8}  {"-" * 8}  {"-" * 8}  {"-" * 8}')
+            for label, metric in [
+                ('Δcm_state__ip',     d_ip),
+                ('Δcm_state__l1diff', d_l1diff),
+                ('Δc_state__ip',      d_c_ip),
+                ('Δc_state__l1diff',  d_c_l1diff),
+            ]:
+                tau, p_tau = kendalltau(d_forgetting, metric)
+                rho, p_rho = spearmanr(d_forgetting,  metric)
+                sig_tau = '*' if p_tau < 0.05 else (' .' if p_tau < 0.10 else '  ')
+                sig_rho = '*' if p_rho < 0.05 else (' .' if p_rho < 0.10 else '  ')
+                print(
+                    f'  {label:<25}  {tau:>+8.4f}  {p_tau:>8.4f}{sig_tau} '
+                    f'{rho:>+8.4f}  {p_rho:>8.4f}{sig_rho}'
+                )
+            print(f'{"=" * 70}')
+
         return {
             'global':  results,
             'records': self.drift_records,
