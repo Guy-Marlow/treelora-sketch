@@ -35,6 +35,12 @@ Usage example:
 
     # Disable TreeLoRA regularisation (plain sequential LoRA):
         --reg 0
+
+    # Per-epoch drift analysis (unconstrained forgetting baseline):
+        --drift_analysis --reg 0
+
+    # Per-epoch drift analysis with partial regularisation:
+        --drift_analysis --reg 0.05
 """
 
 import argparse
@@ -148,6 +154,11 @@ class ViTCLTrainer:
 
         # Sketch bank: one dict of 7 CountMinSketches per task, built in train_one_task
         self.sketch_bank: list[dict] = []
+
+        # Drift analysis: per-epoch sketch vs. forgetting tracking
+        self.canonical_sketches: list = []  # one cm_state CMS per completed task
+        self.canonical_accs: list     = []  # acc_matrix[t, t] for each completed task
+        self.drift_records: list      = []  # dicts: task/epoch/prior_task/forgetting/ip/l1diff
         self._adapter_total_params = sum(
             p.numel() for n, p in self.model.named_parameters()
             if 'loranew_A' in n or 'loranew_B' in n
@@ -203,6 +214,14 @@ class ViTCLTrainer:
         if not parts_A and not parts_B:
             return None
         return torch.cat(parts_A + parts_B)
+
+    def _build_state_sketch(self) -> CountMinSketch:
+        """Fresh cm_state CMS from the current adapter — used for per-epoch drift tracking."""
+        sk = CountMinSketch(self._sketch_d, self._sketch_w, device=self.device, dtype=torch.float32)
+        state_flat = self._flat_adapter_vec(use_grad=False)
+        if state_flat is not None:
+            sk.insert_vec(state_flat.abs())
+        return sk
 
     def _flat_ab_product_vec(self) -> torch.Tensor | None:
         """
@@ -380,6 +399,33 @@ class ViTCLTrainer:
                 f'loss={epoch_loss:.4f}  train_acc={epoch_acc:.3f}'
             )
 
+            # ── Per-epoch drift analysis ──────────────────────────────────────
+            if getattr(self.args, 'drift_analysis', False):
+                with torch.no_grad():
+                    scratch_sk = self._build_state_sketch()
+                    if task_id > 0:
+                        for prior_t in range(task_id):
+                            prior_acc   = self.canonical_accs[prior_t]
+                            current_acc = self.evaluate_task(prior_t)
+                            forgetting  = prior_acc - current_acc
+                            ip  = float(scratch_sk.inner_product(self.canonical_sketches[prior_t]))
+                            l1d = float(scratch_sk.l1_sketch_diff(self.canonical_sketches[prior_t]))
+                            self.drift_records.append({
+                                'task': task_id, 'epoch': epoch, 'prior_task': prior_t,
+                                'forgetting': forgetting, 'ip': ip, 'l1diff': l1d,
+                            })
+                            print(
+                                f'    [drift] vs T{prior_t}: '
+                                f'forgetting={forgetting:+.4f}  ip={ip:.4f}  l1diff={l1d:.4f}'
+                            )
+                    # At the last epoch: store canonical sketch and accuracy for this task
+                    if epoch == epochs - 1:
+                        canon_acc = self.evaluate_task(task_id)
+                        self.canonical_sketches.append(scratch_sk)
+                        self.canonical_accs.append(canon_acc)
+                        print(f'    [drift] T{task_id} canonical stored  acc={canon_acc:.4f}')
+            # ── End per-epoch drift analysis ──────────────────────────────────
+
         # ── Task boundary: record final adapter state, store sketches ─────────
         with torch.no_grad():
             # Signed accumulated quantities — insert mean for CountSketch path.
@@ -477,6 +523,9 @@ class ViTCLTrainer:
         metrics = self._compute_metrics()
         sketch_results = self.analyze_sketch_correlations()
         metrics['sketch_analysis'] = sketch_results
+        if getattr(self.args, 'drift_analysis', False):
+            drift_results = self.analyze_drift_correlations()
+            metrics['drift_analysis'] = drift_results
         return metrics
 
     # ── Final metrics ─────────────────────────────────────────────────────────
@@ -640,6 +689,75 @@ class ViTCLTrainer:
             'rho':        rho_results,
         }
 
+    def analyze_drift_correlations(self) -> dict:
+        """
+        Rank-correlation analysis over all per-epoch drift records.
+
+        Each record is one (task, epoch, prior_task) triple containing:
+            forgetting = canonical_acc[prior_task] - current_acc_on_prior_task
+            ip         = inner_product(current_sketch, canonical_sketch[prior_task])
+            l1diff     = l1_sketch_diff(current_sketch, canonical_sketch[prior_task])
+
+        Reports global Kendall τ / Spearman ρ for ip and l1diff vs. forgetting,
+        then a per-prior-task breakdown so per-task drift trajectories are visible.
+        """
+        from scipy.stats import kendalltau, spearmanr
+
+        if not self.drift_records:
+            print('\n  [drift analysis] No records — was --drift_analysis set?')
+            return {}
+
+        forgetting = np.array([r['forgetting'] for r in self.drift_records])
+        ip         = np.array([r['ip']         for r in self.drift_records])
+        l1diff     = np.array([r['l1diff']     for r in self.drift_records])
+        n          = len(forgetting)
+
+        print(f'\n{"=" * 70}')
+        print('  Drift Analysis — Sketch–Forgetting Correlation (per-epoch)')
+        print(f'  {n} data points  (tasks × epochs × prior tasks)')
+        print(f'{"=" * 70}')
+
+        results = {}
+        print(f'\n  {"Metric":<25}  {"τ":>8}  {"p(τ)":>8}  {"ρ":>8}  {"p(ρ)":>8}')
+        print(f'  {"-" * 25}  {"-" * 8}  {"-" * 8}  {"-" * 8}  {"-" * 8}')
+        for label, metric in [('cm_state__ip', ip), ('cm_state__l1diff', l1diff)]:
+            tau, p_tau = kendalltau(forgetting, metric)
+            rho, p_rho = spearmanr(forgetting,  metric)
+            sig_tau = '*' if p_tau < 0.05 else (' .' if p_tau < 0.10 else '  ')
+            sig_rho = '*' if p_rho < 0.05 else (' .' if p_rho < 0.10 else '  ')
+            print(
+                f'  {label:<25}  {tau:>+8.4f}  {p_tau:>8.4f}{sig_tau} '
+                f'{rho:>+8.4f}  {p_rho:>8.4f}{sig_rho}'
+            )
+            results[label] = {
+                'tau': float(tau), 'p_tau': float(p_tau),
+                'rho': float(rho), 'p_rho': float(p_rho),
+            }
+
+        # Per-prior-task breakdown
+        prior_tasks = sorted(set(r['prior_task'] for r in self.drift_records))
+        if len(prior_tasks) > 1:
+            print(f'\n  Per-prior-task (cm_state__ip):')
+            print(f'  {"Prior":>6}  {"n":>4}  {"τ":>8}  {"p(τ)":>8}')
+            print(f'  {"-" * 6}  {"-" * 4}  {"-" * 8}  {"-" * 8}')
+            per_task = {}
+            for pt in prior_tasks:
+                recs  = [r for r in self.drift_records if r['prior_task'] == pt]
+                f_pt  = np.array([r['forgetting'] for r in recs])
+                ip_pt = np.array([r['ip']         for r in recs])
+                if len(f_pt) >= 3:
+                    tau, p_tau = kendalltau(f_pt, ip_pt)
+                    sig = '*' if p_tau < 0.05 else (' .' if p_tau < 0.10 else '  ')
+                    print(f'  T{pt:<5d}  {len(recs):>4d}  {tau:>+8.4f}  {p_tau:>8.4f}{sig}')
+                    per_task[pt] = {'tau': float(tau), 'p_tau': float(p_tau), 'n': len(recs)}
+
+        print(f'{"=" * 70}')
+
+        return {
+            'global':  results,
+            'records': self.drift_records,
+        }
+
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
@@ -690,6 +808,12 @@ def parse_args():
     # Tree regularisation
     p.add_argument('--reg', type=float, default=0.1,
                    help='Regularisation coefficient λ (0 = disable tree reg)')
+
+    # Drift analysis
+    p.add_argument('--drift_analysis', action='store_true', default=False,
+                   help='Per-epoch sketch–forgetting drift tracking: evaluates all prior tasks '
+                        'at the end of each epoch and records ip/l1diff vs. forgetting. '
+                        'Use --reg 0 for unconstrained forgetting or reduce --reg for partial drift.')
 
     # Output
     p.add_argument('--output_dir', default='',
