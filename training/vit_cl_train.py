@@ -90,7 +90,7 @@ def _setup_logging(log_path: str):
     return tee
 
 from model.vit_lora import build_treelora_vit
-from utils.dyadic_cms import CountMinSketch, CountSketch
+from utils.dyadic_cms import CountMinSketch
 from utils.kd_lora_tree import KD_LoRA_Tree
 from utils.data.vision_cl_datasets import (
     make_split_cifar100,
@@ -152,25 +152,16 @@ class ViTCLTrainer:
         # acc_matrix[i, j] = accuracy on task j after training through task i
         self.acc_matrix = np.zeros((num_tasks, num_tasks), dtype=np.float32)
 
-        # Sketch bank: one dict of 7 CountMinSketches per task, built in train_one_task
-        self.sketch_bank: list[dict] = []
-
         # Drift analysis: per-epoch sketch vs. forgetting tracking
         self.canonical_sketches: list = []  # one cm_state CMS per completed task
         self.canonical_accs: list     = []  # acc_matrix[t, t] for each completed task
         self.drift_records: list      = []  # dicts: task/epoch/prior_task/forgetting/ip/l1diff
-        self._adapter_total_params = sum(
+        _adapter_total_params = sum(
             p.numel() for n, p in self.model.named_parameters()
             if 'loranew_A' in n or 'loranew_B' in n
         )
-        _w_frac = getattr(args, 'sketch_w_frac', 0.05)
         self._sketch_d = getattr(args, 'sketch_d', 8)
-        self._sketch_w = math.ceil(_w_frac * self._adapter_total_params)
-        # Separate width for the AB-product sketch (d_out×d_in per layer >> r×d per layer)
-        _A_shapes = [p.shape for n, p in self.model.named_parameters() if 'loranew_A' in n]
-        _B_shapes = [p.shape for n, p in self.model.named_parameters() if 'loranew_B' in n]
-        self._ab_total_params = sum(b[0] * a[1] for a, b in zip(_A_shapes, _B_shapes))
-        self._sketch_w_ab = math.ceil(_w_frac * self._ab_total_params)
+        self._sketch_w = math.ceil(getattr(args, 'sketch_w_frac', 0.05) * _adapter_total_params)
 
     # ── Feature extraction ────────────────────────────────────────────────────
 
@@ -194,90 +185,29 @@ class ViTCLTrainer:
 
     # ── Adapter sketch helpers ────────────────────────────────────────────────
 
-    def _flat_adapter_vec(self, use_grad: bool = False) -> torch.Tensor | None:
-        """
-        Return a 1-D detached tensor: all loranew_A params/grads (in layer order)
-        concatenated with all loranew_B params/grads.  Returns None if any entry
-        is missing (e.g. grads not yet computed).
-        """
-        parts_A, parts_B = [], []
+    def _flat_adapter_vec(self) -> torch.Tensor | None:
+        """All loranew_A and loranew_B parameter values concatenated and flattened."""
+        parts = []
         for name, p in self.model.named_parameters():
-            src = p.grad if use_grad else p.data
-            if 'loranew_A' in name:
-                if src is None:
-                    return None
-                parts_A.append(src.detach().reshape(-1))
-            elif 'loranew_B' in name:
-                if src is None:
-                    return None
-                parts_B.append(src.detach().reshape(-1))
-        if not parts_A and not parts_B:
-            return None
-        return torch.cat(parts_A + parts_B)
+            if 'loranew_A' in name or 'loranew_B' in name:
+                parts.append(p.data.detach().reshape(-1))
+        return torch.cat(parts) if parts else None
 
     def _build_state_sketch(self) -> CountMinSketch:
-        """Fresh cm_state CMS from the current adapter — used for per-epoch drift tracking."""
+        """
+        Fresh CMS from the L2-normalised current adapter — used for per-epoch drift tracking.
+        Normalising before insert makes ip approximate cosine similarity and l1diff
+        approximate the corresponding scale-invariant distance, so both metrics reflect
+        directional drift rather than parameter magnitude growth.
+        """
         sk = CountMinSketch(self._sketch_d, self._sketch_w, device=self.device, dtype=torch.float32)
-        state_flat = self._flat_adapter_vec(use_grad=False)
+        state_flat = self._flat_adapter_vec()
         if state_flat is not None:
+            norm = state_flat.norm(p=2)
+            if norm > 0:
+                state_flat = state_flat / norm
             sk.insert_vec(state_flat.abs())
         return sk
-
-    def _flat_ab_product_vec(self) -> torch.Tensor | None:
-        """
-        For each LoRA layer (in parameter iteration order), compute
-        (loranew_B.weight @ loranew_A.weight) and concatenate the flattened
-        products.  Returns None if any A/B pair is missing or counts differ.
-        """
-        A_params, B_params = [], []
-        for name, p in self.model.named_parameters():
-            if 'loranew_A' in name:
-                A_params.append(p.detach())
-            elif 'loranew_B' in name:
-                B_params.append(p.detach())
-        if not A_params or len(A_params) != len(B_params):
-            return None
-        return torch.cat([(B @ A).reshape(-1) for A, B in zip(A_params, B_params)])
-
-    def _init_task_sketches(self) -> dict:
-        """Create 7 fresh sketches for one task (CMS or CountSketch per --sketch_type)."""
-        use_cs = getattr(self.args, 'sketch_type', 'cms') == 'cs'
-        if use_cs:
-            def make():
-                return CountSketch(
-                    self._sketch_d, self._sketch_w,
-                    device=self.device, dtype=torch.float32,
-                )
-            return {
-                'cm_grad_abs':            make(),
-                'cm_grad_squared':        make(),
-                'cm_taylor':              make(),
-                'cm_weight_diff':         make(),
-                'cm_weight_diff_squared': make(),
-                'cm_state':               make(),
-                'cm_state_ab':            CountSketch(
-                    self._sketch_d, self._sketch_w_ab,
-                    device=self.device, dtype=torch.float32,
-                ),
-            }
-        else:
-            def make():
-                return CountMinSketch(
-                    self._sketch_d, self._sketch_w,
-                    device=self.device, dtype=torch.float32,
-                )
-            return {
-                'cm_grad_abs':            make(),
-                'cm_grad_squared':        make(),
-                'cm_taylor':              make(),
-                'cm_weight_diff':         make(),
-                'cm_weight_diff_squared': make(),
-                'cm_state':               make(),
-                'cm_state_ab':            CountMinSketch(
-                    self._sketch_d, self._sketch_w_ab,
-                    device=self.device, dtype=torch.float32,
-                ),
-            }
 
     # ── Single-task training ──────────────────────────────────────────────────
 
@@ -294,17 +224,6 @@ class ViTCLTrainer:
             lr=self.args.lr,
             betas=(0.9, 0.999),
         )
-
-        # Fresh set of 7 sketches for this task
-        sketches  = self._init_task_sketches()
-        use_cs    = getattr(self.args, 'sketch_type', 'cms') == 'cs'
-
-        # CountSketch: accumulate signed running sums; insert once at task end.
-        # CMS:         insert abs values per batch throughout training.
-        cs_grad_acc        = None
-        cs_taylor_acc      = None
-        cs_weight_diff_acc = None
-        cs_batch_count     = 0
 
         for epoch in range(epochs):
             self.model.train()
@@ -348,38 +267,7 @@ class ViTCLTrainer:
                     lora_params + list(head.parameters()), max_norm=1.0
                 )
 
-                # ── Per-batch sketch updates (read-only; no graph impact) ────
-                pre_step = None
-                with torch.no_grad():
-                    grad_flat  = self._flat_adapter_vec(use_grad=True)
-                    param_flat = self._flat_adapter_vec(use_grad=False)
-                    if grad_flat is not None and param_flat is not None:
-                        if use_cs:
-                            # Accumulate signed quantities; insert at task end.
-                            cs_grad_acc   = grad_flat        if cs_grad_acc   is None else cs_grad_acc   + grad_flat
-                            cs_taylor_acc = grad_flat * param_flat if cs_taylor_acc is None else cs_taylor_acc + grad_flat * param_flat
-                        else:
-                            sketches['cm_grad_abs'].insert_vec(grad_flat.abs())
-                            sketches['cm_taylor'].insert_vec((grad_flat * param_flat).abs())
-                        # Squared quantities are always positive — insert per-batch for both paths.
-                        sketches['cm_grad_squared'].insert_vec(grad_flat ** 2)
-                        pre_step = param_flat
-
                 optimizer.step()
-
-                with torch.no_grad():
-                    if pre_step is not None:
-                        post_flat = self._flat_adapter_vec(use_grad=False)
-                        diff = post_flat - pre_step
-                        if use_cs:
-                            cs_weight_diff_acc = diff if cs_weight_diff_acc is None else cs_weight_diff_acc + diff
-                        else:
-                            sketches['cm_weight_diff'].insert_vec(diff.abs())
-                        sketches['cm_weight_diff_squared'].insert_vec(diff ** 2)
-
-                if use_cs and grad_flat is not None:
-                    cs_batch_count += 1
-                # ── End per-batch sketch updates ─────────────────────────────
 
                 with torch.no_grad():
                     preds           = logits.argmax(dim=1)
@@ -425,25 +313,6 @@ class ViTCLTrainer:
                         self.canonical_accs.append(canon_acc)
                         print(f'    [drift] T{task_id} canonical stored  acc={canon_acc:.4f}')
             # ── End per-epoch drift analysis ──────────────────────────────────
-
-        # ── Task boundary: record final adapter state, store sketches ─────────
-        with torch.no_grad():
-            # Signed accumulated quantities — insert mean for CountSketch path.
-            if use_cs and cs_batch_count > 0:
-                sketches['cm_grad_abs'].insert_vec(cs_grad_acc / cs_batch_count)
-                sketches['cm_taylor'].insert_vec(cs_taylor_acc / cs_batch_count)
-                sketches['cm_weight_diff'].insert_vec(cs_weight_diff_acc / cs_batch_count)
-
-            # State snapshots: CMS requires abs() (non-negativity guarantee);
-            # CS accepts signed values so we preserve direction.
-            state_flat = self._flat_adapter_vec(use_grad=False)
-            if state_flat is not None:
-                sketches['cm_state'].insert_vec(state_flat if use_cs else state_flat.abs())
-            ab_flat = self._flat_ab_product_vec()
-            if ab_flat is not None:
-                sketches['cm_state_ab'].insert_vec(ab_flat if use_cs else ab_flat.abs())
-
-        self.sketch_bank.append(sketches)
 
         if self.tree is not None:
             self.tree.end_task(task_id=task_id)
@@ -521,8 +390,6 @@ class ViTCLTrainer:
             self.save_checkpoint(task_id)
 
         metrics = self._compute_metrics()
-        sketch_results = self.analyze_sketch_correlations()
-        metrics['sketch_analysis'] = sketch_results
         if getattr(self.args, 'drift_analysis', False):
             drift_results = self.analyze_drift_correlations()
             metrics['drift_analysis'] = drift_results
@@ -578,116 +445,7 @@ class ViTCLTrainer:
 
         return metrics
 
-    # ── Sketch–forgetting correlation analysis ────────────────────────────────
-
-    def analyze_sketch_correlations(self) -> dict:
-        """
-        For all (t, t') pairs where t > t', compare the sketches built during
-        training on task t against those from task t', and measure how well
-        each comparison metric predicts the forgetting of task t' by model M_t.
-
-        All pairs are included — including backward-transfer cases (forgetting ≤ 0).
-        The hypothesis is monotonic: increasing forgetting should correlate with
-        decreasing sketch similarity (lower inner_product, higher l1_sketch_diff).
-        Backward-transfer pairs sit at the low end of the forgetting spectrum and
-        provide additional support for the same relationship.
-
-        Table layout  (15 rows × n_pairs columns):
-            row  0          : forgetting = acc_matrix[t',t'] - acc_matrix[t,t']
-            rows 1,3,5,...  : inner_product(sketch_t, sketch_t')   per sketch
-            rows 2,4,6,...  : l1_sketch_diff(sketch_t, sketch_t')  per sketch
-
-        Sketch order: cm_grad_abs, cm_grad_squared, cm_taylor,
-                      cm_weight_diff, cm_weight_diff_squared, cm_state,
-                      cm_state_ab
-
-        Kendall's tau is computed between the forgetting row and every metric
-        row when at least 3 pairs are available.
-        """
-        from scipy.stats import kendalltau, spearmanr
-
-        num_tasks = len(self.task_info)
-        sketch_names = [
-            'cm_grad_abs', 'cm_grad_squared', 'cm_taylor',
-            'cm_weight_diff', 'cm_weight_diff_squared', 'cm_state',
-            'cm_state_ab',
-        ]
-
-        # All (t, t') pairs with t > t', ordered outer-by-t, inner-by-t'
-        pairs   = [(t, tp) for t in range(num_tasks) for tp in range(t)]
-        n_pairs = len(pairs)
-
-        if n_pairs == 0:
-            print('\n  [sketch analysis] Need ≥ 2 tasks; nothing to compare.')
-            return {}
-
-        row_labels = ['forgetting']
-        for sk in sketch_names:
-            row_labels += [f'{sk}__ip', f'{sk}__l1diff']
-        n_rows = len(row_labels)   # 1 + 7*2 = 15
-
-        table = np.zeros((n_rows, n_pairs), dtype=np.float64)
-
-        for col, (t, tp) in enumerate(pairs):
-            # Forgetting: peak accuracy on task tp minus current model's accuracy on tp
-            table[0, col] = float(self.acc_matrix[tp, tp] - self.acc_matrix[t, tp])
-
-            for sk_idx, sk_name in enumerate(sketch_names):
-                sk_t  = self.sketch_bank[t][sk_name]
-                sk_tp = self.sketch_bank[tp][sk_name]
-
-                ip  = sk_t.inner_product(sk_tp)
-                l1d = sk_t.l1_sketch_diff(sk_tp)
-
-                table[1 + sk_idx * 2,     col] = float(ip)
-                table[1 + sk_idx * 2 + 1, col] = float(l1d)
-
-        # ── Print raw table ───────────────────────────────────────────────────
-        pair_labels = [f'(M{t}←T{tp})' for (t, tp) in pairs]
-        col_w = max(10, max(len(l) for l in pair_labels) + 1)
-
-        print(f'\n{"=" * 70}')
-        print('  Sketch–Forgetting Correlation Analysis')
-        print(f'  {n_pairs} task pair(s)  ·  {n_rows - 1} sketch metrics')
-        print(f'{"=" * 70}')
-
-        # Header row
-        header = f'  {"Metric":<42}' + ''.join(f'{l:>{col_w}}' for l in pair_labels)
-        print(header)
-        print(f'  {"-" * 42}' + '-' * (col_w * n_pairs))
-
-        for row_idx, label in enumerate(row_labels):
-            vals = ''.join(f'{table[row_idx, col]:>{col_w}.4f}' for col in range(n_pairs))
-            print(f'  {label:<42}{vals}')
-
-        # ── Kendall τ and Spearman ρ ──────────────────────────────────────────
-        tau_results = {}
-        rho_results = {}
-        if n_pairs >= 3:
-            forgetting = table[0, :]
-            print(f'\n  {"Metric":<42}  {"τ":>8}  {"p(τ)":>8}  {"ρ":>8}  {"p(ρ)":>8}')
-            print(f'  {"-" * 42}  {"-" * 8}  {"-" * 8}  {"-" * 8}  {"-" * 8}')
-            for row_idx in range(1, n_rows):
-                label = row_labels[row_idx]
-                tau,  p_tau = kendalltau(forgetting, table[row_idx, :])
-                rho,  p_rho = spearmanr(forgetting,  table[row_idx, :])
-                tau_results[label] = {'tau': float(tau), 'pval': float(p_tau)}
-                rho_results[label] = {'rho': float(rho), 'pval': float(p_rho)}
-                sig_tau = '*' if p_tau < 0.05 else (' .' if p_tau < 0.10 else '  ')
-                sig_rho = '*' if p_rho < 0.05 else (' .' if p_rho < 0.10 else '  ')
-                print(f'  {label:<42}  {tau:>8.4f}  {p_tau:>8.4f}{sig_tau} {rho:>8.4f}  {p_rho:>8.4f}{sig_rho}')
-        else:
-            print(f'\n  (rank correlations require ≥ 3 pairs; have {n_pairs} — raw values above.)')
-
-        print(f'{"=" * 70}')
-
-        return {
-            'table':      table.tolist(),
-            'row_labels': row_labels,
-            'pairs':      [(int(t), int(tp)) for (t, tp) in pairs],
-            'tau':        tau_results,
-            'rho':        rho_results,
-        }
+    # ── Drift correlation analysis ────────────────────────────────────────────
 
     def analyze_drift_correlations(self) -> dict:
         """
@@ -796,10 +554,7 @@ def parse_args():
                    help='Learning rate — constant, no decay (paper: 0.005)')
     p.add_argument('--num_workers', type=int, default=4)
 
-    # Sketch algorithm and dimensions
-    p.add_argument('--sketch_type', choices=['cms', 'cs'], default='cms',
-                   help='cms = CountMinSketch (per-batch abs inserts); '
-                        'cs  = CountSketch (JL projection, signed mean gradient)')
+    # Sketch dimensions
     p.add_argument('--sketch_w_frac', type=float, default=0.05,
                    help='Sketch width as a fraction of total adapter params')
     p.add_argument('--sketch_d', type=int, default=8,
@@ -841,9 +596,7 @@ def main():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         'vit_cl_logs',
     )
-    _sketch_tag = args.sketch_type if args.sketch_type != 'cms' else ''
-    _sketch_tag = f'-{_sketch_tag}' if _sketch_tag else ''
-    _log_path = os.path.join(_log_dir, f'vitb-16-21k-{_benchmark_slug}{_sketch_tag}.log')
+    _log_path = os.path.join(_log_dir, f'vitb-16-21k-{_benchmark_slug}.log')
     _tee = _setup_logging(_log_path)
     print(f'Logging to {_log_path}')
 
