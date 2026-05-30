@@ -90,7 +90,7 @@ def _setup_logging(log_path: str):
     return tee
 
 from model.vit_lora import build_treelora_vit
-from utils.dyadic_cms import CountMinSketch
+from utils.dyadic_cms import CountMinSketch, CountSketch
 from utils.kd_lora_tree import KD_LoRA_Tree
 from utils.data.vision_cl_datasets import (
     make_split_cifar100,
@@ -153,9 +153,9 @@ class ViTCLTrainer:
         self.acc_matrix = np.zeros((num_tasks, num_tasks), dtype=np.float32)
 
         # Drift analysis: per-epoch sketch vs. forgetting tracking
-        self.canonical_sketches: list = []  # one cm_state CMS per completed task
+        self.canonical_sketches: list = []  # one {'cms': CMS, 'cs': CS} dict per completed task
         self.canonical_accs: list     = []  # acc_matrix[t, t] for each completed task
-        self.drift_records: list      = []  # dicts: task/epoch/prior_task/forgetting/ip/l1diff
+        self.drift_records: list      = []  # dicts: task/epoch/prior_task/forgetting/ip/l1diff/c_ip/c_l1diff
         _adapter_total_params = sum(
             p.numel() for n, p in self.model.named_parameters()
             if 'loranew_A' in n or 'loranew_B' in n
@@ -193,21 +193,25 @@ class ViTCLTrainer:
                 parts.append(p.data.detach().reshape(-1))
         return torch.cat(parts) if parts else None
 
-    def _build_state_sketch(self) -> CountMinSketch:
+    def _build_state_sketches(self) -> dict:
         """
-        Fresh CMS from the L2-normalised current adapter — used for per-epoch drift tracking.
-        Normalising before insert makes ip approximate cosine similarity and l1diff
-        approximate the corresponding scale-invariant distance, so both metrics reflect
-        directional drift rather than parameter magnitude growth.
+        Build a paired CMS + CS from the L2-normalised current adapter.
+
+        Both sketches are built from the same unit-norm vector. CMS receives
+        abs(vec) (non-negativity required); CS receives the signed vec directly,
+        so its inner product approximates true cosine similarity rather than
+        the absolute-value overlap that CMS measures.
         """
-        sk = CountMinSketch(self._sketch_d, self._sketch_w, device=self.device, dtype=torch.float32)
+        cms = CountMinSketch(self._sketch_d, self._sketch_w, device=self.device, dtype=torch.float32)
+        cs  = CountSketch(   self._sketch_d, self._sketch_w, device=self.device, dtype=torch.float32)
         state_flat = self._flat_adapter_vec()
         if state_flat is not None:
             norm = state_flat.norm(p=2)
             if norm > 0:
                 state_flat = state_flat / norm
-            sk.insert_vec(state_flat.abs())
-        return sk
+            cms.insert_vec(state_flat.abs())
+            cs.insert_vec(state_flat)
+        return {'cms': cms, 'cs': cs}
 
     # ── Single-task training ──────────────────────────────────────────────────
 
@@ -290,26 +294,36 @@ class ViTCLTrainer:
             # ── Per-epoch drift analysis ──────────────────────────────────────
             if getattr(self.args, 'drift_analysis', False):
                 with torch.no_grad():
-                    scratch_sk = self._build_state_sketch()
+                    raw_vec = self._flat_adapter_vec()
+                    if raw_vec is not None:
+                        print(f'    [drift] adapter L2 norm: {raw_vec.norm(p=2).item():.4f}')
+                    scratch = self._build_state_sketches()
                     if task_id > 0:
                         for prior_t in range(task_id):
                             prior_acc   = self.canonical_accs[prior_t]
                             current_acc = self.evaluate_task(prior_t)
                             forgetting  = prior_acc - current_acc
-                            ip  = float(scratch_sk.inner_product(self.canonical_sketches[prior_t]))
-                            l1d = float(scratch_sk.l1_sketch_diff(self.canonical_sketches[prior_t]))
+                            canon       = self.canonical_sketches[prior_t]
+                            ip     = float(scratch['cms'].inner_product(canon['cms']))
+                            l1d    = float(scratch['cms'].l1_sketch_diff(canon['cms']))
+                            c_ip   = float(scratch['cs'].inner_product(canon['cs']))
+                            c_l1d  = float(scratch['cs'].l1_sketch_diff(canon['cs']))
                             self.drift_records.append({
                                 'task': task_id, 'epoch': epoch, 'prior_task': prior_t,
-                                'forgetting': forgetting, 'ip': ip, 'l1diff': l1d,
+                                'forgetting': forgetting,
+                                'ip': ip, 'l1diff': l1d,
+                                'c_ip': c_ip, 'c_l1diff': c_l1d,
                             })
                             print(
                                 f'    [drift] vs T{prior_t}: '
-                                f'forgetting={forgetting:+.4f}  ip={ip:.4f}  l1diff={l1d:.4f}'
+                                f'forgetting={forgetting:+.4f}  '
+                                f'cms_ip={ip:.4f}  cms_l1diff={l1d:.4f}  '
+                                f'cs_ip={c_ip:.4f}  cs_l1diff={c_l1d:.4f}'
                             )
-                    # At the last epoch: store canonical sketch and accuracy for this task
+                    # At the last epoch: store canonical sketches and accuracy for this task
                     if epoch == epochs - 1:
                         canon_acc = self.evaluate_task(task_id)
-                        self.canonical_sketches.append(scratch_sk)
+                        self.canonical_sketches.append(scratch)
                         self.canonical_accs.append(canon_acc)
                         print(f'    [drift] T{task_id} canonical stored  acc={canon_acc:.4f}')
             # ── End per-epoch drift analysis ──────────────────────────────────
@@ -468,6 +482,8 @@ class ViTCLTrainer:
         forgetting = np.array([r['forgetting'] for r in self.drift_records])
         ip         = np.array([r['ip']         for r in self.drift_records])
         l1diff     = np.array([r['l1diff']     for r in self.drift_records])
+        c_ip       = np.array([r['c_ip']       for r in self.drift_records])
+        c_l1diff   = np.array([r['c_l1diff']   for r in self.drift_records])
         n          = len(forgetting)
 
         print(f'\n{"=" * 70}')
@@ -478,7 +494,12 @@ class ViTCLTrainer:
         results = {}
         print(f'\n  {"Metric":<25}  {"τ":>8}  {"p(τ)":>8}  {"ρ":>8}  {"p(ρ)":>8}')
         print(f'  {"-" * 25}  {"-" * 8}  {"-" * 8}  {"-" * 8}  {"-" * 8}')
-        for label, metric in [('cm_state__ip', ip), ('cm_state__l1diff', l1diff)]:
+        for label, metric in [
+            ('cm_state__ip',    ip),
+            ('cm_state__l1diff', l1diff),
+            ('c_state__ip',     c_ip),
+            ('c_state__l1diff', c_l1diff),
+        ]:
             tau, p_tau = kendalltau(forgetting, metric)
             rho, p_rho = spearmanr(forgetting,  metric)
             sig_tau = '*' if p_tau < 0.05 else (' .' if p_tau < 0.10 else '  ')
@@ -492,22 +513,21 @@ class ViTCLTrainer:
                 'rho': float(rho), 'p_rho': float(p_rho),
             }
 
-        # Per-prior-task breakdown
+        # Per-prior-task breakdown for both ip metrics
         prior_tasks = sorted(set(r['prior_task'] for r in self.drift_records))
         if len(prior_tasks) > 1:
-            print(f'\n  Per-prior-task (cm_state__ip):')
-            print(f'  {"Prior":>6}  {"n":>4}  {"τ":>8}  {"p(τ)":>8}')
-            print(f'  {"-" * 6}  {"-" * 4}  {"-" * 8}  {"-" * 8}')
-            per_task = {}
-            for pt in prior_tasks:
-                recs  = [r for r in self.drift_records if r['prior_task'] == pt]
-                f_pt  = np.array([r['forgetting'] for r in recs])
-                ip_pt = np.array([r['ip']         for r in recs])
-                if len(f_pt) >= 3:
-                    tau, p_tau = kendalltau(f_pt, ip_pt)
-                    sig = '*' if p_tau < 0.05 else (' .' if p_tau < 0.10 else '  ')
-                    print(f'  T{pt:<5d}  {len(recs):>4d}  {tau:>+8.4f}  {p_tau:>8.4f}{sig}')
-                    per_task[pt] = {'tau': float(tau), 'p_tau': float(p_tau), 'n': len(recs)}
+            for ip_label, ip_key in [('cm_state__ip', 'ip'), ('c_state__ip', 'c_ip')]:
+                print(f'\n  Per-prior-task ({ip_label}):')
+                print(f'  {"Prior":>6}  {"n":>4}  {"τ":>8}  {"p(τ)":>8}')
+                print(f'  {"-" * 6}  {"-" * 4}  {"-" * 8}  {"-" * 8}')
+                for pt in prior_tasks:
+                    recs   = [r for r in self.drift_records if r['prior_task'] == pt]
+                    f_pt   = np.array([r['forgetting'] for r in recs])
+                    ip_pt  = np.array([r[ip_key]       for r in recs])
+                    if len(f_pt) >= 3:
+                        tau, p_tau = kendalltau(f_pt, ip_pt)
+                        sig = '*' if p_tau < 0.05 else (' .' if p_tau < 0.10 else '  ')
+                        print(f'  T{pt:<5d}  {len(recs):>4d}  {tau:>+8.4f}  {p_tau:>8.4f}{sig}')
 
         print(f'{"=" * 70}')
 
