@@ -153,15 +153,24 @@ class ViTCLTrainer:
         self.acc_matrix = np.zeros((num_tasks, num_tasks), dtype=np.float32)
 
         # Drift analysis: per-epoch sketch vs. forgetting tracking
-        self.canonical_sketches: list = []  # one {'cms': CMS, 'cs': CS} dict per completed task
-        self.canonical_accs: list     = []  # acc_matrix[t, t] for each completed task
-        self.drift_records: list      = []  # dicts: task/epoch/prior_task/forgetting/ip/l1diff/c_ip/c_l1diff
+        self.canonical_sketches: list   = []  # one {'cms': CMS, 'cs': CS} dict per completed task (A+B, normalised)
+        self.canonical_a_sketches: list = []  # one {'cms': CMS, 'cs': CS} dict per completed task (A-only, raw)
+        self.canonical_a_vecs: list     = []  # list of per-layer loranew_A tensors (CPU) per completed task
+        self.canonical_accs: list       = []  # acc_matrix[t, t] for each completed task
+        self.drift_records: list        = []  # dicts with forgetting + all sketch/exact metrics per epoch
+
+        _w_frac = getattr(args, 'sketch_w_frac', 0.05)
+        self._sketch_d = getattr(args, 'sketch_d', 8)
         _adapter_total_params = sum(
             p.numel() for n, p in self.model.named_parameters()
             if 'loranew_A' in n or 'loranew_B' in n
         )
-        self._sketch_d = getattr(args, 'sketch_d', 8)
-        self._sketch_w = math.ceil(getattr(args, 'sketch_w_frac', 0.05) * _adapter_total_params)
+        self._sketch_w = math.ceil(_w_frac * _adapter_total_params)
+        # Separate sketch width for A-only (half the parameters)
+        _a_total_params = sum(
+            p.numel() for n, p in self.model.named_parameters() if 'loranew_A' in n
+        )
+        self._sketch_w_a = math.ceil(_w_frac * _a_total_params)
 
     # ── Feature extraction ────────────────────────────────────────────────────
 
@@ -192,6 +201,34 @@ class ViTCLTrainer:
             if 'loranew_A' in name or 'loranew_B' in name:
                 parts.append(p.data.detach().reshape(-1))
         return torch.cat(parts) if parts else None
+
+    def _flat_a_vec(self) -> torch.Tensor | None:
+        """Concatenated loranew_A values only — not normalised, shallow→deep order."""
+        parts = [p.data.detach().reshape(-1)
+                 for n, p in self.model.named_parameters() if 'loranew_A' in n]
+        return torch.cat(parts) if parts else None
+
+    def _per_layer_a_vecs(self) -> list:
+        """Per-layer loranew_A tensors (flattened), one per LoRA layer, shallow→deep."""
+        return [p.data.detach().reshape(-1)
+                for n, p in self.model.named_parameters() if 'loranew_A' in n]
+
+    def _build_a_sketches(self) -> dict:
+        """
+        CMS + CS of the concatenated loranew_A vector — NOT normalised.
+
+        This is the sketch analogue of the paper's exact dot-product comparison:
+        the inner product between two such sketches approximates the dot product
+        between raw loranew_A vectors, which is what TreeLoRA's regularisation
+        loss actually computes.
+        """
+        cms = CountMinSketch(self._sketch_d, self._sketch_w_a, device=self.device, dtype=torch.float32)
+        cs  = CountSketch(   self._sketch_d, self._sketch_w_a, device=self.device, dtype=torch.float32)
+        a_flat = self._flat_a_vec()
+        if a_flat is not None:
+            cms.insert_vec(a_flat.abs())
+            cs.insert_vec(a_flat)
+        return {'cms': cms, 'cs': cs}
 
     def _build_state_sketches(self) -> dict:
         """
@@ -297,33 +334,70 @@ class ViTCLTrainer:
                     raw_vec = self._flat_adapter_vec()
                     if raw_vec is not None:
                         print(f'    [drift] adapter L2 norm: {raw_vec.norm(p=2).item():.4f}')
-                    scratch = self._build_state_sketches()
+
+                    # Normalised A+B sketches (existing)
+                    scratch    = self._build_state_sketches()
+                    # Unnormalised A-only sketches and exact per-layer vectors
+                    scratch_a  = self._build_a_sketches()
+                    cur_a_lyrs = self._per_layer_a_vecs()
+
                     if task_id > 0:
                         for prior_t in range(task_id):
                             prior_acc   = self.canonical_accs[prior_t]
                             current_acc = self.evaluate_task(prior_t)
                             forgetting  = prior_acc - current_acc
-                            canon       = self.canonical_sketches[prior_t]
+
+                            # ── Normalised A+B sketch metrics ─────────────────
+                            canon  = self.canonical_sketches[prior_t]
                             ip     = float(scratch['cms'].inner_product(canon['cms']))
                             l1d    = float(scratch['cms'].l1_sketch_diff(canon['cms']))
                             c_ip   = float(scratch['cs'].inner_product(canon['cs']))
                             c_l1d  = float(scratch['cs'].l1_sketch_diff(canon['cs']))
-                            self.drift_records.append({
+
+                            # ── Unnormalised A-only sketch metrics ────────────
+                            canon_a  = self.canonical_a_sketches[prior_t]
+                            a_cms_ip  = float(scratch_a['cms'].inner_product(canon_a['cms']))
+                            a_cms_l1d = float(scratch_a['cms'].l1_sketch_diff(canon_a['cms']))
+                            a_cs_ip   = float(scratch_a['cs'].inner_product(canon_a['cs']))
+                            a_cs_l1d  = float(scratch_a['cs'].l1_sketch_diff(canon_a['cs']))
+
+                            # ── Exact per-layer L1 norms (paper's metric, exactly) ──
+                            can_a_lyrs  = self.canonical_a_vecs[prior_t]
+                            a_l1_layers = [
+                                float((cur_a_lyrs[i].to(self.device) - can_a_lyrs[i].to(self.device)).abs().sum())
+                                for i in range(len(cur_a_lyrs))
+                            ]
+                            # L1 of the full concatenated difference (shallow→deep)
+                            cur_a_cat = torch.cat([v for v in cur_a_lyrs])
+                            can_a_cat = torch.cat([v.to(self.device) for v in can_a_lyrs])
+                            a_l1_concat = float((cur_a_cat - can_a_cat).abs().sum())
+
+                            record = {
                                 'task': task_id, 'epoch': epoch, 'prior_task': prior_t,
                                 'forgetting': forgetting,
-                                'ip': ip, 'l1diff': l1d,
-                                'c_ip': c_ip, 'c_l1diff': c_l1d,
-                            })
+                                # normalised A+B sketches
+                                'ip':     ip,    'l1diff':     l1d,
+                                'c_ip':   c_ip,  'c_l1diff':   c_l1d,
+                                # unnormalised A-only sketches
+                                'a_cms_ip': a_cms_ip, 'a_cms_l1diff': a_cms_l1d,
+                                'a_cs_ip':  a_cs_ip,  'a_cs_l1diff':  a_cs_l1d,
+                                # exact metrics
+                                'a_l1_concat':  a_l1_concat,
+                                'a_l1_layers':  a_l1_layers,
+                            }
+                            self.drift_records.append(record)
                             print(
                                 f'    [drift] vs T{prior_t}: '
                                 f'forgetting={forgetting:+.4f}  '
-                                f'cms_ip={ip:.4f}  cms_l1diff={l1d:.4f}  '
-                                f'cs_ip={c_ip:.4f}  cs_l1diff={c_l1d:.4f}'
+                                f'cms_ip={ip:.4f}  cs_ip={c_ip:.4f}  '
+                                f'a_cs_ip={a_cs_ip:.4f}  a_l1={a_l1_concat:.2f}'
                             )
-                    # At the last epoch: store canonical sketches and accuracy for this task
+                    # At the last epoch: store all canonicals for this task
                     if epoch == epochs - 1:
                         canon_acc = self.evaluate_task(task_id)
                         self.canonical_sketches.append(scratch)
+                        self.canonical_a_sketches.append(scratch_a)
+                        self.canonical_a_vecs.append([v.cpu() for v in cur_a_lyrs])
                         self.canonical_accs.append(canon_acc)
                         print(f'    [drift] T{task_id} canonical stored  acc={canon_acc:.4f}')
             # ── End per-epoch drift analysis ──────────────────────────────────
@@ -479,12 +553,24 @@ class ViTCLTrainer:
             print('\n  [drift analysis] No records — was --drift_analysis set?')
             return {}
 
-        forgetting = np.array([r['forgetting'] for r in self.drift_records])
-        ip         = np.array([r['ip']         for r in self.drift_records])
-        l1diff     = np.array([r['l1diff']     for r in self.drift_records])
-        c_ip       = np.array([r['c_ip']       for r in self.drift_records])
-        c_l1diff   = np.array([r['c_l1diff']   for r in self.drift_records])
-        n          = len(forgetting)
+        forgetting  = np.array([r['forgetting']    for r in self.drift_records])
+        ip          = np.array([r['ip']            for r in self.drift_records])
+        l1diff      = np.array([r['l1diff']        for r in self.drift_records])
+        c_ip        = np.array([r['c_ip']          for r in self.drift_records])
+        c_l1diff    = np.array([r['c_l1diff']      for r in self.drift_records])
+        a_cms_ip    = np.array([r['a_cms_ip']      for r in self.drift_records])
+        a_cms_l1d   = np.array([r['a_cms_l1diff']  for r in self.drift_records])
+        a_cs_ip     = np.array([r['a_cs_ip']       for r in self.drift_records])
+        a_cs_l1d    = np.array([r['a_cs_l1diff']   for r in self.drift_records])
+        a_l1_concat = np.array([r['a_l1_concat']   for r in self.drift_records])
+        n           = len(forgetting)
+
+        # Per-layer exact L1 norms — number of layers may vary with lora_depth
+        n_layers = len(self.drift_records[0]['a_l1_layers'])
+        a_l1_layer = [
+            np.array([r['a_l1_layers'][i] for r in self.drift_records])
+            for i in range(n_layers)
+        ]
 
         print(f'\n{"=" * 70}')
         print('  Drift Analysis — Sketch–Forgetting Correlation (per-epoch)')
@@ -492,20 +578,28 @@ class ViTCLTrainer:
         print(f'{"=" * 70}')
 
         results = {}
-        print(f'\n  {"Metric":<25}  {"τ":>8}  {"p(τ)":>8}  {"ρ":>8}  {"p(ρ)":>8}')
-        print(f'  {"-" * 25}  {"-" * 8}  {"-" * 8}  {"-" * 8}  {"-" * 8}')
-        for label, metric in [
-            ('cm_state__ip',    ip),
-            ('cm_state__l1diff', l1diff),
-            ('c_state__ip',     c_ip),
-            ('c_state__l1diff', c_l1diff),
-        ]:
+        print(f'\n  {"Metric":<30}  {"τ":>8}  {"p(τ)":>8}  {"ρ":>8}  {"p(ρ)":>8}')
+        print(f'  {"-" * 30}  {"-" * 8}  {"-" * 8}  {"-" * 8}  {"-" * 8}')
+
+        all_metrics = [
+            ('cm_state__ip',         ip),
+            ('cm_state__l1diff',     l1diff),
+            ('c_state__ip',          c_ip),
+            ('c_state__l1diff',      c_l1diff),
+            ('a_cms__ip  (A-raw)',   a_cms_ip),
+            ('a_cms__l1diff (A-raw)', a_cms_l1d),
+            ('a_cs__ip   (A-raw)',   a_cs_ip),
+            ('a_cs__l1diff  (A-raw)', a_cs_l1d),
+            ('a_l1_concat (exact)',  a_l1_concat),
+        ] + [(f'a_l1_layer_{i} (exact)', a_l1_layer[i]) for i in range(n_layers)]
+
+        for label, metric in all_metrics:
             tau, p_tau = kendalltau(forgetting, metric)
             rho, p_rho = spearmanr(forgetting,  metric)
             sig_tau = '*' if p_tau < 0.05 else (' .' if p_tau < 0.10 else '  ')
             sig_rho = '*' if p_rho < 0.05 else (' .' if p_rho < 0.10 else '  ')
             print(
-                f'  {label:<25}  {tau:>+8.4f}  {p_tau:>8.4f}{sig_tau} '
+                f'  {label:<30}  {tau:>+8.4f}  {p_tau:>8.4f}{sig_tau} '
                 f'{rho:>+8.4f}  {p_rho:>8.4f}{sig_rho}'
             )
             results[label] = {
@@ -513,10 +607,14 @@ class ViTCLTrainer:
                 'rho': float(rho), 'p_rho': float(p_rho),
             }
 
-        # Per-prior-task breakdown for both ip metrics
+        # Per-prior-task breakdown for the key ip metrics
         prior_tasks = sorted(set(r['prior_task'] for r in self.drift_records))
         if len(prior_tasks) > 1:
-            for ip_label, ip_key in [('cm_state__ip', 'ip'), ('c_state__ip', 'c_ip')]:
+            for ip_label, ip_key in [
+                ('cm_state__ip',        'ip'),
+                ('c_state__ip',         'c_ip'),
+                ('a_cs__ip (A-raw)',    'a_cs_ip'),
+            ]:
                 print(f'\n  Per-prior-task ({ip_label}):')
                 print(f'  {"Prior":>6}  {"n":>4}  {"τ":>8}  {"p(τ)":>8}')
                 print(f'  {"-" * 6}  {"-" * 4}  {"-" * 8}  {"-" * 8}')
@@ -537,7 +635,10 @@ class ViTCLTrainer:
         # both series (e.g. l1diff always increases while forgetting drifts up
         # overall) and tests whether the rate of sketch movement genuinely tracks
         # the rate of forgetting change — a stricter and more informative test.
-        d_forgetting, d_ip, d_l1diff, d_c_ip, d_c_l1diff = [], [], [], [], []
+        d = {k: [] for k in [
+            'forgetting', 'ip', 'l1diff', 'c_ip', 'c_l1diff',
+            'a_cms_ip', 'a_cms_l1diff', 'a_cs_ip', 'a_cs_l1diff', 'a_l1_concat',
+        ] + [f'a_l1_layer_{i}' for i in range(n_layers)]}
 
         sorted_recs = sorted(
             self.drift_records,
@@ -548,39 +649,53 @@ class ViTCLTrainer:
             if (prev is not None
                     and r['task'] == prev['task']
                     and r['prior_task'] == prev['prior_task']):
-                d_forgetting.append(r['forgetting'] - prev['forgetting'])
-                d_ip.append(        r['ip']         - prev['ip'])
-                d_l1diff.append(    r['l1diff']     - prev['l1diff'])
-                d_c_ip.append(      r['c_ip']       - prev['c_ip'])
-                d_c_l1diff.append(  r['c_l1diff']   - prev['c_l1diff'])
+                d['forgetting'].append(r['forgetting']   - prev['forgetting'])
+                d['ip'].append(        r['ip']           - prev['ip'])
+                d['l1diff'].append(    r['l1diff']       - prev['l1diff'])
+                d['c_ip'].append(      r['c_ip']         - prev['c_ip'])
+                d['c_l1diff'].append(  r['c_l1diff']     - prev['c_l1diff'])
+                d['a_cms_ip'].append(  r['a_cms_ip']     - prev['a_cms_ip'])
+                d['a_cms_l1diff'].append(r['a_cms_l1diff'] - prev['a_cms_l1diff'])
+                d['a_cs_ip'].append(   r['a_cs_ip']      - prev['a_cs_ip'])
+                d['a_cs_l1diff'].append(r['a_cs_l1diff'] - prev['a_cs_l1diff'])
+                d['a_l1_concat'].append(r['a_l1_concat'] - prev['a_l1_concat'])
+                for i in range(n_layers):
+                    d[f'a_l1_layer_{i}'].append(
+                        r['a_l1_layers'][i] - prev['a_l1_layers'][i]
+                    )
             prev = r
 
-        if len(d_forgetting) >= 3:
-            d_forgetting = np.array(d_forgetting)
-            d_ip         = np.array(d_ip)
-            d_l1diff     = np.array(d_l1diff)
-            d_c_ip       = np.array(d_c_ip)
-            d_c_l1diff   = np.array(d_c_l1diff)
-            nd = len(d_forgetting)
+        nd = len(d['forgetting'])
+        if nd >= 3:
+            d = {k: np.array(v) for k, v in d.items()}
 
             print(f'\n{"=" * 70}')
             print('  First-Differences Analysis (epoch-to-epoch Δ)')
             print(f'  {nd} consecutive-epoch pairs')
             print(f'{"=" * 70}')
-            print(f'\n  {"Metric":<25}  {"τ":>8}  {"p(τ)":>8}  {"ρ":>8}  {"p(ρ)":>8}')
-            print(f'  {"-" * 25}  {"-" * 8}  {"-" * 8}  {"-" * 8}  {"-" * 8}')
-            for label, metric in [
-                ('Δcm_state__ip',     d_ip),
-                ('Δcm_state__l1diff', d_l1diff),
-                ('Δc_state__ip',      d_c_ip),
-                ('Δc_state__l1diff',  d_c_l1diff),
-            ]:
-                tau, p_tau = kendalltau(d_forgetting, metric)
-                rho, p_rho = spearmanr(d_forgetting,  metric)
+            print(f'\n  {"Metric":<30}  {"τ":>8}  {"p(τ)":>8}  {"ρ":>8}  {"p(ρ)":>8}')
+            print(f'  {"-" * 30}  {"-" * 8}  {"-" * 8}  {"-" * 8}  {"-" * 8}')
+
+            d_metrics = [
+                ('Δcm_state__ip',          d['ip']),
+                ('Δcm_state__l1diff',      d['l1diff']),
+                ('Δc_state__ip',           d['c_ip']),
+                ('Δc_state__l1diff',       d['c_l1diff']),
+                ('Δa_cms__ip  (A-raw)',    d['a_cms_ip']),
+                ('Δa_cms__l1diff (A-raw)', d['a_cms_l1diff']),
+                ('Δa_cs__ip   (A-raw)',    d['a_cs_ip']),
+                ('Δa_cs__l1diff  (A-raw)', d['a_cs_l1diff']),
+                ('Δa_l1_concat (exact)',   d['a_l1_concat']),
+            ] + [(f'Δa_l1_layer_{i} (exact)', d[f'a_l1_layer_{i}'])
+                 for i in range(n_layers)]
+
+            for label, metric in d_metrics:
+                tau, p_tau = kendalltau(d['forgetting'], metric)
+                rho, p_rho = spearmanr(d['forgetting'],  metric)
                 sig_tau = '*' if p_tau < 0.05 else (' .' if p_tau < 0.10 else '  ')
                 sig_rho = '*' if p_rho < 0.05 else (' .' if p_rho < 0.10 else '  ')
                 print(
-                    f'  {label:<25}  {tau:>+8.4f}  {p_tau:>8.4f}{sig_tau} '
+                    f'  {label:<30}  {tau:>+8.4f}  {p_tau:>8.4f}{sig_tau} '
                     f'{rho:>+8.4f}  {p_rho:>8.4f}{sig_rho}'
                 )
             print(f'{"=" * 70}')
