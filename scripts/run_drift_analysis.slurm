@@ -18,9 +18,16 @@ python3 ../scripts/setup.py \
 
 # Per-epoch drift analysis across all 5 benchmarks.
 # --reg 0: no regularisation — tree is not constructed, adapter fine-tunes freely.
-# --drift_analysis: build CMS+CS sketch pairs each epoch, evaluate all prior tasks,
-#   record (forgetting, cms_ip, cms_l1diff, cs_ip, cs_l1diff) per (task, epoch,
-#   prior_task) triple. Produces both absolute and first-differences correlations.
+# --drift_analysis: at the end of each epoch, evaluates all prior tasks and records
+#   per (task, epoch, prior_task):
+#     forgetting                — canonical_acc - current_acc on prior task
+#     cms_ip / cms_l1diff       — normalised A+B CMS metrics
+#     c_ip  / c_l1diff          — normalised A+B CS metrics
+#     a_cms_ip / a_cms_l1diff   — unnormalised A-only CMS (paper's scale)
+#     a_cs_ip  / a_cs_l1diff    — unnormalised A-only CS  (paper's scale)
+#     a_l1_concat               — exact L1 of concatenated loranew_A difference
+#     a_l1_layer_{0..N}         — exact per-layer loranew_A L1 norms
+#   Produces absolute and first-differences Kendall τ / Spearman ρ at run end.
 #
 # Note: the three ImageNet-R variants write to separate log subdirectories because
 # all three share the same benchmark slug (split-imagenet-r) and would otherwise
