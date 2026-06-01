@@ -202,6 +202,21 @@ class CountMinSketch:
             print('Sketches not compatible; returning 0.')
             return 0
 
+    def top_k(self, num_indices, k):
+        """
+        Return the indices of the k highest-estimated elements.
+
+        Queries all num_indices positions in one vectorised pass (d gather
+        operations), takes the per-index CMS minimum across rows, then calls
+        torch.topk.  Returns (values, indices) exactly like torch.topk.
+        """
+        all_idx = torch.arange(num_indices, device=self.device, dtype=torch.int64)
+        row_estimates = torch.stack(
+            [self.cms[i][self.hash_funcs[i](all_idx)] for i in range(self.d)]
+        )  # (d, num_indices)
+        estimates = row_estimates.min(dim=0).values  # (num_indices,)
+        return torch.topk(estimates, k)
+
 class DyadicRangeCMS:
     def __init__(self, w_frac: float, num_indices: int, device, dtype,
                  phi: float = 0.001, delta: float = 0.075):
