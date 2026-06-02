@@ -154,8 +154,15 @@ class ViTCLTrainer:
 
         # Drift analysis: per-epoch sketch vs. forgetting tracking
         self.canonical_sketches: list   = []  # one {'cms': CMS, 'cs': CS} dict per completed task (A+B, normalised)
+        self.canonical_A_mats:   list   = []  # one list[Tensor] of loranew_A params (CPU) per completed task
         self.canonical_accs: list       = []  # acc_matrix[t, t] for each completed task
         self.drift_records: list        = []  # dicts with forgetting + sketch metrics per epoch
+
+        # Accumulator for batch-mean of loranew_A during the final training epoch.
+        # Matches the paper's all_accumulate_grads[task_id] = mean of loranew_A
+        # values across batches within the last epoch (reset each epoch via new_epoch_init).
+        self._A_epoch_sum:   list | None = None
+        self._A_epoch_steps: int         = 0
 
         _w_frac = getattr(args, 'sketch_w_frac', 0.05)
         self._sketch_d = getattr(args, 'sketch_d', 8)
@@ -194,6 +201,25 @@ class ViTCLTrainer:
             if 'loranew_A' in name or 'loranew_B' in name:
                 parts.append(p.data.detach().reshape(-1))
         return torch.cat(parts) if parts else None
+
+    def _get_current_A_mats(self) -> list[torch.Tensor]:
+        """Per-layer loranew_A tensors, detached and cloned to CPU."""
+        return [
+            p.data.detach().cpu().clone()
+            for n, p in self.model.named_parameters()
+            if 'loranew_A' in n
+        ]
+
+    def _get_epoch_mean_A_mats(self) -> list[torch.Tensor]:
+        """
+        Mean of loranew_A values accumulated across batches in the current epoch.
+        Matches the paper's all_accumulate_grads[task_id] = mean(loranew_A over
+        batches in the final epoch). Falls back to the current snapshot if the
+        accumulator was never populated (e.g. drift_analysis was off).
+        """
+        if self._A_epoch_sum is None or self._A_epoch_steps == 0:
+            return self._get_current_A_mats()
+        return [s / self._A_epoch_steps for s in self._A_epoch_sum]
 
     def _build_state_sketches(self) -> dict:
         """
@@ -238,6 +264,11 @@ class ViTCLTrainer:
             if self.tree is not None:
                 self.tree.new_epoch_init(len(train_loader))
 
+            # Reset batch-mean accumulator each epoch (only last epoch's mean is kept)
+            if getattr(self.args, 'drift_analysis', False):
+                self._A_epoch_sum   = None
+                self._A_epoch_steps = 0
+
             running_loss = running_correct = running_total = 0
             pbar = tqdm(
                 train_loader,
@@ -266,6 +297,21 @@ class ViTCLTrainer:
                                 grad_tensor, loss, task_id, prev_ids
                             )
                             loss = loss - reg_loss
+
+                # Accumulate loranew_A values BEFORE the gradient update, matching
+                # the paper's insert_grad call site (before zero_grad/backward/step).
+                # The epoch-start reset ensures only the current epoch's mean accumulates,
+                # giving the intra-epoch running mean the paper uses for task similarity.
+                # No epoch guard — we accumulate every epoch so the drift block can use
+                # the epoch mean as the current-side representation each time it runs.
+                if getattr(self.args, 'drift_analysis', False):
+                    with torch.no_grad():
+                        a_step = self._get_current_A_mats()
+                        if self._A_epoch_sum is None:
+                            self._A_epoch_sum = a_step
+                        else:
+                            self._A_epoch_sum = [s + a for s, a in zip(self._A_epoch_sum, a_step)]
+                        self._A_epoch_steps += 1
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -300,7 +346,8 @@ class ViTCLTrainer:
                     if raw_vec is not None:
                         print(f'    [drift] adapter L2 norm: {raw_vec.norm(p=2).item():.4f}')
 
-                    scratch = self._build_state_sketches()
+                    scratch    = self._build_state_sketches()
+                    cur_A_mats = self._get_epoch_mean_A_mats()
 
                     if task_id > 0:
                         for prior_t in range(task_id):
@@ -308,28 +355,52 @@ class ViTCLTrainer:
                             current_acc = self.evaluate_task(prior_t)
                             forgetting  = prior_acc - current_acc
 
+                            # Sketch-based comparisons (LOI 1)
                             canon = self.canonical_sketches[prior_t]
                             ip    = float(scratch['cms'].inner_product(canon['cms']))
                             l1d   = float(scratch['cms'].l1_sketch_diff(canon['cms']))
                             c_ip  = float(scratch['cs'].inner_product(canon['cs']))
                             c_l1d = float(scratch['cs'].l1_sketch_diff(canon['cs']))
 
+                            # Direct A-matrix comparisons (LOI 2, exact — no sketch)
+                            can_A_mats = self.canonical_A_mats[prior_t]
+                            cur_A_flat = torch.cat([m.reshape(-1) for m in cur_A_mats])
+                            can_A_flat = torch.cat([m.reshape(-1) for m in can_A_mats])
+                            a_l1 = float((cur_A_flat - can_A_flat).abs().sum())
+                            a_ip = float(torch.dot(cur_A_flat, can_A_flat))
+                            a_l1_layers = [
+                                float((c.reshape(-1) - k.reshape(-1)).abs().sum())
+                                for c, k in zip(cur_A_mats, can_A_mats)
+                            ]
+                            a_ip_layers = [
+                                float(torch.dot(c.reshape(-1), k.reshape(-1)))
+                                for c, k in zip(cur_A_mats, can_A_mats)
+                            ]
+
                             record = {
                                 'task': task_id, 'epoch': epoch, 'prior_task': prior_t,
                                 'forgetting': forgetting,
                                 'ip':   ip,   'l1diff':   l1d,
                                 'c_ip': c_ip, 'c_l1diff': c_l1d,
+                                'a_l1': a_l1, 'a_ip': a_ip,
+                                'a_l1_layers': a_l1_layers,
+                                'a_ip_layers': a_ip_layers,
                             }
                             self.drift_records.append(record)
                             print(
                                 f'    [drift] vs T{prior_t}: '
                                 f'forgetting={forgetting:+.4f}  '
-                                f'cms_ip={ip:.4f}  cs_ip={c_ip:.4f}'
+                                f'cms_ip={ip:.4f}  cms_l1diff={l1d:.4f}  '
+                                f'cs_ip={c_ip:.4f}  cs_l1diff={c_l1d:.4f}  '
+                                f'A_ip={a_ip:.4f}  A_l1={a_l1:.4f}'
                             )
-                    # At the last epoch: store canonicals for this task
+                    # At the last epoch: store canonicals for this task.
+                    # canonical_A_mats uses the batch-mean of loranew_A across the final
+                    # epoch, matching the paper's all_accumulate_grads[task_id].
                     if epoch == epochs - 1:
                         canon_acc = self.evaluate_task(task_id)
                         self.canonical_sketches.append(scratch)
+                        self.canonical_A_mats.append(self._get_epoch_mean_A_mats())
                         self.canonical_accs.append(canon_acc)
                         print(f'    [drift] T{task_id} canonical stored  acc={canon_acc:.4f}')
             # ── End per-epoch drift analysis ──────────────────────────────────
@@ -490,6 +561,8 @@ class ViTCLTrainer:
         l1diff     = np.array([r['l1diff']     for r in self.drift_records])
         c_ip       = np.array([r['c_ip']       for r in self.drift_records])
         c_l1diff   = np.array([r['c_l1diff']   for r in self.drift_records])
+        a_l1       = np.array([r['a_l1']       for r in self.drift_records]) if 'a_l1' in self.drift_records[0] else None
+        a_ip       = np.array([r['a_ip']       for r in self.drift_records]) if 'a_ip' in self.drift_records[0] else None
         n          = len(forgetting)
 
         print(f'\n{"=" * 70}')
@@ -507,6 +580,11 @@ class ViTCLTrainer:
             ('c_state__ip',      c_ip),
             ('c_state__l1diff',  c_l1diff),
         ]
+        if a_ip is not None:
+            all_metrics += [
+                ('A_global__ip',  a_ip),
+                ('A_global__l1',  a_l1),
+            ]
 
         for label, metric in all_metrics:
             tau, p_tau = kendalltau(forgetting, metric)
@@ -524,11 +602,11 @@ class ViTCLTrainer:
 
         # Per-prior-task breakdown for the key ip metrics
         prior_tasks = sorted(set(r['prior_task'] for r in self.drift_records))
+        _ip_keys = [('cm_state__ip', 'ip'), ('c_state__ip', 'c_ip')]
+        if a_ip is not None:
+            _ip_keys.append(('A_global__ip', 'a_ip'))
         if len(prior_tasks) > 1:
-            for ip_label, ip_key in [
-                ('cm_state__ip', 'ip'),
-                ('c_state__ip',  'c_ip'),
-            ]:
+            for ip_label, ip_key in _ip_keys:
                 print(f'\n  Per-prior-task ({ip_label}):')
                 print(f'  {"Prior":>6}  {"n":>4}  {"τ":>8}  {"p(τ)":>8}')
                 print(f'  {"-" * 6}  {"-" * 4}  {"-" * 8}  {"-" * 8}')
@@ -543,13 +621,27 @@ class ViTCLTrainer:
 
         print(f'{"=" * 70}')
 
+        # ── Per-layer A-matrix breakdown ──────────────────────────────────────
+        if a_ip is not None and 'a_ip_layers' in self.drift_records[0]:
+            num_layers = len(self.drift_records[0]['a_ip_layers'])
+            print(f'\n  Per-layer A-matrix ip (A_global__ip split by layer):')
+            print(f'  {"Layer":>6}  {"n":>4}  {"τ":>8}  {"p(τ)":>8}')
+            print(f'  {"-"*6}  {"-"*4}  {"-"*8}  {"-"*8}')
+            for j in range(num_layers):
+                ip_j   = np.array([r['a_ip_layers'][j] for r in self.drift_records])
+                tau_j, p_tau_j = kendalltau(forgetting, ip_j)
+                sig = '*' if p_tau_j < 0.05 else (' .' if p_tau_j < 0.10 else '  ')
+                print(f'  L{j:<5d}  {n:>4d}  {tau_j:>+8.4f}  {p_tau_j:>8.4f}{sig}')
+            print()
+
         # ── First-differences analysis ────────────────────────────────────────
         # Correlate epoch-to-epoch CHANGES in forgetting against epoch-to-epoch
         # CHANGES in sketch metrics.  This removes any monotonic trend shared by
         # both series (e.g. l1diff always increases while forgetting drifts up
         # overall) and tests whether the rate of sketch movement genuinely tracks
         # the rate of forgetting change — a stricter and more informative test.
-        d = {k: [] for k in ['forgetting', 'ip', 'l1diff', 'c_ip', 'c_l1diff']}
+        _has_a = a_ip is not None
+        d = {k: [] for k in ['forgetting', 'ip', 'l1diff', 'c_ip', 'c_l1diff', 'a_l1', 'a_ip']}
 
         sorted_recs = sorted(
             self.drift_records,
@@ -565,6 +657,9 @@ class ViTCLTrainer:
                 d['l1diff'].append(    r['l1diff']     - prev['l1diff'])
                 d['c_ip'].append(      r['c_ip']       - prev['c_ip'])
                 d['c_l1diff'].append(  r['c_l1diff']   - prev['c_l1diff'])
+                if _has_a:
+                    d['a_l1'].append(  r['a_l1']       - prev['a_l1'])
+                    d['a_ip'].append(  r['a_ip']       - prev['a_ip'])
             prev = r
 
         nd = len(d['forgetting'])
@@ -584,6 +679,11 @@ class ViTCLTrainer:
                 ('Δc_state__ip',      d['c_ip']),
                 ('Δc_state__l1diff',  d['c_l1diff']),
             ]
+            if _has_a and d['a_ip']:
+                d_metrics += [
+                    ('ΔA_global__ip',  np.array(d['a_ip'])),
+                    ('ΔA_global__l1',  np.array(d['a_l1'])),
+                ]
 
             for label, metric in d_metrics:
                 tau, p_tau = kendalltau(d['forgetting'], metric)
