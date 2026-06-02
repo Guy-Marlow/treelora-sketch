@@ -12,9 +12,7 @@ cd /data/gmar762/research/continuous_learning/treelora
 source /data/gmar762/anaconda3/etc/profile.d/conda.sh
 conda activate treelora
 
-mkdir -p vit_cl_logs/loi2_cub_backbone/imagenet_r_5t
 mkdir -p vit_cl_logs/loi2_cub_backbone/imagenet_r_10t
-mkdir -p vit_cl_logs/loi2_cub_backbone/imagenet_r_20t
 
 # Per-epoch drift analysis with both sketch (LOI 1) and direct A-matrix (LOI 2)
 # comparisons, using the CUB-200 fine-tuned backbone.
@@ -30,25 +28,6 @@ mkdir -p vit_cl_logs/loi2_cub_backbone/imagenet_r_20t
 # --drift_analysis: per-epoch evaluation of all prior tasks + both comparison sets.
 
 python3 training/vit_cl_train.py \
-    --model_path PTM/vit-base-patch16-224-cub200 \
-    --dataset    cifar100 \
-    --data_root  data \
-    --reg        0 \
-    --drift_analysis \
-    --output_dir runs/loi2-cub-backbone/split-cifar-100 \
-    --log_dir    vit_cl_logs/loi2_cub_backbone
-
-python3 training/vit_cl_train.py \
-    --model_path       PTM/vit-base-patch16-224-cub200 \
-    --dataset          imagenet_r \
-    --imagenet_r_tasks 5 \
-    --data_root        data \
-    --reg              0 \
-    --drift_analysis \
-    --output_dir       runs/loi2-cub-backbone/split-imagenet-r-5t \
-    --log_dir          vit_cl_logs/loi2_cub_backbone/imagenet_r_5t
-
-python3 training/vit_cl_train.py \
     --model_path       PTM/vit-base-patch16-224-cub200 \
     --dataset          imagenet_r \
     --imagenet_r_tasks 10 \
@@ -59,11 +38,10 @@ python3 training/vit_cl_train.py \
     --log_dir          vit_cl_logs/loi2_cub_backbone/imagenet_r_10t
 
 python3 training/vit_cl_train.py \
-    --model_path       PTM/vit-base-patch16-224-cub200 \
-    --dataset          imagenet_r \
-    --imagenet_r_tasks 20 \
-    --data_root        data \
-    --reg              0 \
+    --model_path PTM/vit-base-patch16-224-cub200 \
+    --dataset    cifar100 \
+    --data_root  data \
+    --reg        0 \
     --drift_analysis \
-    --output_dir       runs/loi2-cub-backbone/split-imagenet-r-20t \
-    --log_dir          vit_cl_logs/loi2_cub_backbone/imagenet_r_20t
+    --output_dir runs/loi2-cub-backbone/split-cifar-100 \
+    --log_dir    vit_cl_logs/loi2_cub_backbone
