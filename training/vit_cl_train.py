@@ -56,6 +56,11 @@ from torch.optim import Adam
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    '..', 'rand_svd_impl',
+))
+from randsvd import rand_svd
 
 
 # ── Logging tee ───────────────────────────────────────────────────────────────
@@ -141,12 +146,27 @@ class ViTCLTrainer:
             for info in task_info
         ]).to(self.device)
 
-        # KD-LoRA Tree (created only when regularisation is requested)
+        # KD-LoRA Tree (treelora method only)
         self.tree = None
-        if args.reg > 0:
+        _method = getattr(args, 'method', 'treelora')
+        if _method == 'olora' and args.reg > 0:
+            print('  [O-LoRA] --reg ignored (tree regularisation not used with O-LoRA)')
+        if _method == 'sketched_lora' and args.reg > 0:
+            print('  [SketchedLoRA] --reg ignored (no tree regularisation with Sketched LoRA)')
+        if _method == 'treelora' and args.reg > 0:
             args.num_tasks   = len(task_info)
             args.global_rank = 0   # single-GPU; suppresses rank-0 guards inside tree
             self.tree = KD_LoRA_Tree(args)
+
+        # O-LoRA: number of tasks whose adapters have been consolidated into lora_A/B.
+        # After consolidating task k, lora_A[adapter] has exactly k*r rows — the
+        # modules are replaced with newly-allocated Linear(in, k*r) each task.
+        self._olora_filled_tasks: int = 0
+
+        # Sketched LoRA bank (Algorithm 1): per-task lists of per-layer (B, A) snapshots (CPU)
+        self.svd_bank_B: list[list[torch.Tensor]] = []
+        self.svd_bank_A: list[list[torch.Tensor]] = []
+
 
         num_tasks = len(task_info)
         # acc_matrix[i, j] = accuracy on task j after training through task i
@@ -241,6 +261,171 @@ class ViTCLTrainer:
             cs.insert_vec(state_flat)
         return {'cms': cms, 'cs': cs}
 
+    # ── O-LoRA helpers ────────────────────────────────────────────────────────
+
+    def _olora_loss(self) -> torch.Tensor:
+        """
+        Orthogonal regularisation loss between the current task's loranew_A and
+        all prior tasks' A-matrices stored in each layer's frozen lora_A.
+
+        With dynamic growth, lora_A.weight has exactly k*r rows — no slicing
+        needed. Gradients flow only through loranew_A; lora_A is detached.
+        """
+        loss = torch.tensor(0.0, device=self.device)
+        if self._olora_filled_tasks == 0:
+            return loss
+        lora_A_params    = [p for n, p in self.model.named_parameters()
+                            if 'lora_A' in n and 'loranew' not in n]
+        loranew_A_params = [p for n, p in self.model.named_parameters()
+                            if 'loranew_A' in n]
+        for frozen_A, cur_A in zip(lora_A_params, loranew_A_params):
+            loss = loss + torch.abs(torch.mm(frozen_A.detach(), cur_A.T)).sum()
+        return loss
+
+    def _olora_consolidate_task(self):
+        """
+        Called at the end of each task (O-LoRA only).
+
+        For each adapted Linear, concatenates the just-trained loranew_A/B
+        weights onto the end of the frozen lora_A/B by replacing those
+        nn.ModuleDict entries with newly-allocated, larger nn.Linear modules.
+        After this call lora_A[adapter].weight has exactly (k+1)*r rows —
+        no zero padding — so forward-pass FLOPs grow by exactly 2*seq*r*(d_in+d_out)
+        per task, matching O-LoRA's theoretical cost curve.
+
+        Then re-initialises loranew_A/B so the next task trains into a fresh adapter.
+        """
+        with torch.no_grad():
+            for _, module in self.model.named_modules():
+                if not (hasattr(module, 'lora_A') and hasattr(module, 'loranew_A')):
+                    continue
+                adapter_name = next(iter(module.lora_A))  # 'default'
+
+                old_A  = module.lora_A[adapter_name]     # nn.Linear(d_in, k*r)
+                old_B  = module.lora_B[adapter_name]     # nn.Linear(k*r, d_out)
+                new_A  = module.loranew_A[adapter_name]  # nn.Linear(d_in, r)
+                new_B  = module.loranew_B[adapter_name]  # nn.Linear(r, d_out)
+
+                # weight shapes: lora_A → [k*r, d_in],  loranew_A → [r, d_in]
+                grown_A_w = torch.cat([old_A.weight.data, new_A.weight.data], dim=0)
+                # weight shapes: lora_B → [d_out, k*r], loranew_B → [d_out, r]
+                grown_B_w = torch.cat([old_B.weight.data, new_B.weight.data], dim=1)
+
+                new_r_sum = grown_A_w.shape[0]  # (k+1)*r
+
+                grown_A = nn.Linear(module.in_features, new_r_sum, bias=False)
+                grown_A.weight.data.copy_(grown_A_w)
+                for p in grown_A.parameters():
+                    p.requires_grad_(False)
+                module.lora_A[adapter_name] = grown_A.to(self.device)
+
+                grown_B = nn.Linear(new_r_sum, module.out_features, bias=False)
+                grown_B.weight.data.copy_(grown_B_w)
+                for p in grown_B.parameters():
+                    p.requires_grad_(False)
+                module.lora_B[adapter_name] = grown_B.to(self.device)
+
+                # Re-initialise loranew for the next task
+                nn.init.kaiming_uniform_(new_A.weight.data, a=math.sqrt(5))
+                nn.init.zeros_(new_B.weight.data)
+
+        self._olora_filled_tasks += 1
+        r = self.args.lora_r
+        print(f'  [O-LoRA] task consolidated: bank now {self._olora_filled_tasks} task(s), '
+              f'{self._olora_filled_tasks * r} rows/layer in forward pass')
+
+    # ── Sketched LoRA helpers (Algorithm 1) ──────────────────────────────────
+
+    def _sketched_lora_snapshot(self):
+        """
+        Algorithm 1, Step 9: K ← K ∪ {(B^(n)_ℓ, A^(n)_ℓ)^L_{ℓ=1}}
+
+        Appends CPU copies of the just-trained loranew_B and loranew_A to the
+        adapter bank.  Order matches named_parameters() iteration, which is
+        consistent across calls and matches _sketched_lora_compress().
+        """
+        snap_B = [
+            p.data.detach().cpu().clone()
+            for n, p in self.model.named_parameters() if 'loranew_B' in n
+        ]
+        snap_A = [
+            p.data.detach().cpu().clone()
+            for n, p in self.model.named_parameters() if 'loranew_A' in n
+        ]
+        self.svd_bank_B.append(snap_B)
+        self.svd_bank_A.append(snap_A)
+        print(f'  [SketchedLoRA] bank holds {len(self.svd_bank_A)} adapter(s)')
+
+    def _sketched_lora_compress(self):
+        """
+        Algorithm 1, Steps 11-15: form ΔW_ℓ = B̂_ℓÂ_ℓ + Σ_k B_k A_k per layer,
+        compress to rank r̂ via RandSVD, write back into lora_A/B, clear bank.
+
+        On the first compression lora_A/B have 0 rows (r_sum started at 0), so we
+        replace the nn.Linear modules with r̂-row ones rather than copying in-place.
+        All subsequent compressions overwrite existing r̂-row modules in-place.
+        """
+        r_hat    = self.args.svd_rank
+        oversamp = self.args.svd_oversample
+
+        lora_modules = [
+            (name, module) for name, module in self.model.named_modules()
+            if hasattr(module, 'lora_A') and hasattr(module, 'loranew_A')
+        ]
+        num_layers   = len(lora_modules)
+        adapter_name = next(iter(lora_modules[0][1].lora_A))
+
+        # Detect first compression: lora_A currently has 0 rows
+        first_compress = (
+            lora_modules[0][1].lora_A[adapter_name].weight.shape[0] == 0
+        )
+
+        for layer_idx, (_, module) in enumerate(lora_modules):
+            A_hat_w = module.lora_A[adapter_name].weight  # [0 or r̂, d_in]
+            B_hat_w = module.lora_B[adapter_name].weight  # [d_out, 0 or r̂]
+
+            # ΔW_ℓ = B̂_ℓ Â_ℓ  (zeros on first compress since weights are 0-row)
+            # + Σ_{k∈K} B_k A_k
+            delta_W = B_hat_w.data @ A_hat_w.data
+            for snap_B, snap_A in zip(self.svd_bank_B, self.svd_bank_A):
+                delta_W = delta_W + snap_B[layer_idx].to(self.device) @ snap_A[layer_idx].to(self.device)
+
+            new_B, new_A = rand_svd(delta_W, r_hat, oversamp)  # [d_out, r̂], [r̂, d_in]
+
+            if first_compress:
+                grown_A = nn.Linear(module.in_features, r_hat, bias=False)
+                grown_A.weight.data.copy_(new_A)
+                for prm in grown_A.parameters(): prm.requires_grad_(False)
+                module.lora_A[adapter_name] = grown_A.to(self.device)
+
+                grown_B = nn.Linear(r_hat, module.out_features, bias=False)
+                grown_B.weight.data.copy_(new_B)
+                for prm in grown_B.parameters(): prm.requires_grad_(False)
+                module.lora_B[adapter_name] = grown_B.to(self.device)
+            else:
+                A_hat_w.data.copy_(new_A)
+                B_hat_w.data.copy_(new_B)
+
+        self.svd_bank_B.clear()
+        self.svd_bank_A.clear()
+        print(f'  [SketchedLoRA] compressed {num_layers} layers → rank {r_hat}; bank cleared')
+
+    def _sketched_lora_reinit(self):
+        """
+        Algorithm 1, Step 4: B^(n)_ℓ ← 0^{d_ℓ×r},  A^(n)_ℓ ∼ N(0, σ²)^{r×d_ℓ}  ∀ ℓ
+
+        Re-initialises loranew_B/A for the next task.  Called after evaluation
+        and (when applicable) compression, matching the algorithm's semantics:
+        Step 4 logically precedes training on task n, but is implemented here as
+        a post-task step so that evaluation can use the just-trained adapter.
+        """
+        for name, param in self.model.named_parameters():
+            if 'loranew_A' in name:
+                # A^(n)_ℓ ∼ N(0, σ²),  σ = 1/√d_in  (standard LoRA scale)
+                nn.init.normal_(param.data, std=1.0 / math.sqrt(param.shape[1]))
+            elif 'loranew_B' in name:
+                nn.init.zeros_(param.data)
+
     # ── Single-task training ──────────────────────────────────────────────────
 
     def train_one_task(self, task_id: int, epochs: int):
@@ -276,7 +461,7 @@ class ViTCLTrainer:
                 leave=False,
             )
 
-            for images, labels in pbar:
+            for step, (images, labels) in enumerate(pbar):
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
 
@@ -297,6 +482,14 @@ class ViTCLTrainer:
                                 grad_tensor, loss, task_id, prev_ids
                             )
                             loss = loss - reg_loss
+
+                # O-LoRA orthogonal regularisation
+                if getattr(self.args, 'method', 'treelora') == 'olora' and self._olora_filled_tasks > 0:
+                    orth_loss = self._olora_loss()
+                    loss = loss + self.args.olora_lambda * orth_loss
+                    if step % 30 == 0:
+                        print(f'    [O-LoRA] step={step}  orth_loss={orth_loss.item():.4f}  '
+                              f'λ={self.args.olora_lambda}')
 
                 # Accumulate loranew_A values BEFORE the gradient update, matching
                 # the paper's insert_grad call site (before zero_grad/backward/step).
@@ -449,6 +642,120 @@ class ViTCLTrainer:
         torch.save(self.task_heads.state_dict(), os.path.join(out, 'task_heads.pt'))
         print(f'  Checkpoint saved → {out}')
 
+    # ── Inference FLOP and memory profiler ───────────────────────────────────
+
+    def _flop_and_memory_profile(self, task_id: int):
+        """
+        Report inference FLOPs and adapter memory after training task task_id.
+
+        Three sections:
+          [1] Actual forward-pass FLOPs via torch.utils.flop_counter.FlopCounterMode
+              on a single dummy image — what the model currently executes.
+          [2] Analytical adapter overhead per method, showing how it scales with
+              task count.  O-LoRA grows as k*r rows per layer; Sketched LoRA is
+              bounded at (r̂+r) rows.  This uses the correct per-token formula
+              (seq_len=197 for 224×224 ViT-B/16) so numbers are exact.
+          [3] Adapter memory footprint broken down by component and location.
+        """
+        from torch.utils.flop_counter import FlopCounterMode
+
+        method      = getattr(self.args, 'method', 'treelora')
+        r           = self.args.lora_r
+        n_trained   = task_id + 1
+
+        # ── Gather per-layer geometry ─────────────────────────────────────────
+        loranew_A = [(n, p) for n, p in self.model.named_parameters() if 'loranew_A' in n]
+        loranew_B = [(n, p) for n, p in self.model.named_parameters() if 'loranew_B' in n]
+        frozen_A  = [(n, p) for n, p in self.model.named_parameters()
+                     if 'lora_A' in n and 'loranew' not in n]
+        frozen_B  = [(n, p) for n, p in self.model.named_parameters()
+                     if 'lora_B' in n and 'loranew' not in n]
+
+        num_layers = len(loranew_A)
+        d_in  = loranew_A[0][1].shape[1] if loranew_A else 768   # [r, d_in]
+        d_out = loranew_B[0][1].shape[0] if loranew_B else 768   # [d_out, r]
+        # For Sketched LoRA: r̂ (compressed rank).
+        # For O-LoRA: exactly k*r rows after k consolidated tasks (no zero padding).
+        # For TreeLoRA: 0 (no frozen adapter).
+        r_hat = frozen_A[0][1].shape[0] if frozen_A else 0
+
+        # ViT-B/16 at 224×224: (224//16)² patches + 1 CLS token
+        seq_len = (224 // 16) ** 2 + 1   # 197
+
+        def adapter_flops(n_rows: int) -> int:
+            """FLOPs for one LoRA pass (batch=1) across all adapted layers.
+
+            Each LoRA pass does two matmuls per layer:
+              x @ A.T  : [seq, d_in] × [d_in, r] → 2 * seq * d_in * r
+              mid @ B.T: [seq, r]    × [r, d_out] → 2 * seq * r * d_out
+            Combined: 2 * seq * r * (d_in + d_out) per layer.
+            """
+            return 2 * seq_len * n_rows * (d_in + d_out) * num_layers
+
+        # ── [1] Actual FLOPs via FlopCounterMode ──────────────────────────────
+        self.model.eval()
+        dummy = torch.zeros(1, 3, 224, 224, device=self.device)
+        with FlopCounterMode(display=False) as fcm:
+            with torch.no_grad():
+                _ = self.model(pixel_values=dummy)
+        total_actual = fcm.get_total_flops()
+
+        # Rows currently active in forward pass per layer:
+        #   O-LoRA:        r_hat (= k*r, dynamically grown) + r (current loranew)
+        #   Sketched LoRA: r̂ + r
+        #   TreeLoRA:      0 + r
+        actual_rows       = r_hat + r
+        actual_adpt_flops = adapter_flops(actual_rows)
+        # Backbone = everything that isn't the LoRA adapter matmuls
+        backbone_flops    = total_actual - actual_adpt_flops
+
+        # ── [2] Memory footprint ─────────────────────────────────────────────
+        def _mb(tensors) -> float:
+            return sum(t.numel() * t.element_size() for t in tensors) / (1024 ** 2)
+
+        loranew_mb = _mb(p for _, p in loranew_A) + _mb(p for _, p in loranew_B)
+        # O-LoRA: frozen_mb = exactly k*r rows (dynamically grown, no zero padding).
+        # Sketched LoRA: frozen_mb = r̂ compressed rows.
+        frozen_mb  = _mb(p for _, p in frozen_A) + _mb(p for _, p in frozen_B)
+        svd_cpu_mb = (_mb(t for snap in self.svd_bank_B for t in snap) +
+                      _mb(t for snap in self.svd_bank_A for t in snap))
+
+        # Inference footprint: frozen adapter + loranew = total GPU adapter memory.
+        inf_gpu_mb = loranew_mb + frozen_mb
+
+        # ── Print ─────────────────────────────────────────────────────────────
+        W = 70
+        print(f'\n{"═"*W}')
+        print(f'  Inference Profile — After Task {task_id}  '
+              f'({n_trained} task(s) trained,  method={method})')
+        print(f'{"═"*W}')
+
+        # --- [1] Actual FLOPs ---
+        print(f'\n  [1] Actual forward-pass FLOPs  '
+              f'(FlopCounterMode, batch=1, seq={seq_len})')
+        print(f'      {"Total model":30s}  {total_actual:>18,}  FLOPs')
+        print(f'      {"Backbone (est.)":30s}  {backbone_flops:>18,}  FLOPs  (constant)')
+        print(f'      {"Adapter (est.)":30s}  {actual_adpt_flops:>18,}  FLOPs  '
+              f'({actual_rows} rows × {num_layers} layers)')
+
+        # --- [2] Memory ---
+        print(f'\n  [2] Adapter memory footprint')
+        print(f'      {"Component":<46}  {"GPU (MB)":>9}  {"CPU (MB)":>9}')
+        print(f'      {"─"*46}  {"─"*9}  {"─"*9}')
+        _D = '—'
+        print(f'      {"loranew_A/B  (current-task, always trainable)":<46}  {loranew_mb:>9.3f}  {_D:>9}')
+        if method == 'olora':
+            k_label = f'lora_A/B  (O-LoRA bank, {self._olora_filled_tasks} tasks × r rows)'
+            print(f'      {k_label:<46}  {frozen_mb:>9.3f}  {_D:>9}')
+        elif method == 'sketched_lora':
+            print(f'      {"lora_A/B  (compressed history, r̂ rows)":<46}  {frozen_mb:>9.3f}  {_D:>9}')
+            print(f'      {"SketchedLoRA pre-compress bank  (B+A, CPU)":<46}  {_D:>9}  {svd_cpu_mb:>9.3f}')
+        else:
+            print(f'      {"lora_A/B  (historical, r_sum rows)":<46}  {frozen_mb:>9.3f}  {_D:>9}')
+        print(f'      {"─"*46}  {"─"*9}  {"─"*9}')
+        print(f'      {"Total GPU at inference":<46}  {inf_gpu_mb:>9.3f}  {_D:>9}')
+        print(f'\n{"═"*W}\n')
+
     # ── Main continual-learning loop ──────────────────────────────────────────
 
     def train_continual(self) -> dict:
@@ -477,6 +784,22 @@ class ViTCLTrainer:
 
             avg_seen = np.mean([results[t] for t in range(task_id + 1)])
             print(f'    Average (tasks 0–{task_id}): {avg_seen * 100:.2f}%')
+
+            # Profile FLOPs and memory after evaluation but before bank operations,
+            # so we see the post-training state with the current adapter still active.
+            self._flop_and_memory_profile(task_id)
+
+            if getattr(self.args, 'method', 'treelora') == 'olora':
+                self._olora_consolidate_task()
+
+            if getattr(self.args, 'method', 'treelora') == 'sketched_lora':
+                # Step 9: K ← K ∪ {(B^(n)_ℓ, A^(n)_ℓ)}
+                self._sketched_lora_snapshot()
+                # Steps 10-15: compress if at a period boundary or the final task
+                if (task_id + 1) % self.args.svd_period == 0 or task_id == num_tasks - 1:
+                    self._sketched_lora_compress()
+                # Step 4 (deferred to post-eval): re-initialise for the next task
+                self._sketched_lora_reinit()
 
             self.save_checkpoint(task_id)
 
@@ -745,15 +1068,41 @@ def parse_args():
     p.add_argument('--sketch_d', type=int, default=8,
                    help='Sketch depth (number of independent hash rows)')
 
+    # Method selection
+    p.add_argument('--method', choices=['treelora', 'olora', 'sketched_lora'],
+                   default='treelora',
+                   help='Continual learning method: treelora (KD-tree regularisation), '
+                        'olora (orthogonal subspace regularisation), or '
+                        'sketched_lora (randomised SVD adapter bank compression)')
+    p.add_argument('--olora_lambda', type=float, default=0.5,
+                   help='O-LoRA orthogonality regularisation coefficient λ₁ '
+                        '(only used when --method olora)')
+
+    # Sketched LoRA (Algorithm 1) hyperparameters
+    p.add_argument('--svd_rank', type=int, default=-1,
+                   help='Target compressed rank r̂ (-1 = same as --lora_r). '
+                        'Only used with --method sketched_lora.')
+    p.add_argument('--svd_period', type=int, default=1,
+                   help='Compression period P: run RandSVD every P tasks. '
+                        'Only used with --method sketched_lora.')
+    p.add_argument('--svd_oversample', type=int, default=2,
+                   help='Oversampling parameter p passed to RandSVD. '
+                        'Only used with --method sketched_lora.')
+
     # Tree regularisation
     p.add_argument('--reg', type=float, default=0.1,
-                   help='Regularisation coefficient λ (0 = disable tree reg)')
+                   help='Regularisation coefficient λ (0 = disable tree reg; '
+                        'ignored when --method olora)')
 
     # Drift analysis
     p.add_argument('--drift_analysis', action='store_true', default=False,
                    help='Per-epoch sketch–forgetting drift tracking: evaluates all prior tasks '
                         'at the end of each epoch and records ip/l1diff vs. forgetting. '
                         'Use --reg 0 for unconstrained forgetting or reduce --reg for partial drift.')
+
+    # Task count limit (for quick trials)
+    p.add_argument('--max_tasks', type=int, default=-1,
+                   help='Stop after this many tasks (-1 = run all tasks in the dataset)')
 
     # Output
     p.add_argument('--output_dir', default='',
@@ -781,9 +1130,18 @@ def main():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         'vit_cl_logs',
     )
-    _log_path = os.path.join(_log_dir, f'vitb-16-21k-{_benchmark_slug}.log')
+    _method_slug = f'-{args.method}' if args.method != 'treelora' else ''
+    _log_path = os.path.join(_log_dir, f'vitb-16-21k-{_benchmark_slug}{_method_slug}.log')
     _tee = _setup_logging(_log_path)
     print(f'Logging to {_log_path}')
+    if args.method == 'sketched_lora' and args.svd_rank < 0:
+        args.svd_rank = args.lora_r
+
+    print(f'Method: {args.method}'
+          + (f'  λ={args.olora_lambda}' if args.method == 'olora' else
+             f'  r̂={args.svd_rank}  P={args.svd_period}  p={args.svd_oversample}'
+             if args.method == 'sketched_lora' else
+             f'  reg={args.reg}' if args.reg > 0 else '  reg=disabled'))
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -821,6 +1179,9 @@ def main():
             num_workers=args.num_workers,
         )
 
+    if args.max_tasks > 0:
+        task_info = task_info[:args.max_tasks]
+        print(f'  (limited to {args.max_tasks} tasks by --max_tasks)')
     num_tasks = len(task_info)
     print(f'  {num_tasks} tasks, {task_info[0]["num_classes"]} classes/task')
     print(f'  Train batches (task 0): {len(task_info[0]["train"])}')
@@ -828,11 +1189,16 @@ def main():
 
     # ── Model ─────────────────────────────────────────────────────────────────
     print(f'\nLoading ViT from {args.model_path} …')
+    # All methods start with r_sum=0 (empty frozen adapter). O-LoRA grows lora_A/B
+    # by r rows per task; Sketched LoRA jumps to r̂ rows at first compression and
+    # stays there. Neither pre-allocates unused capacity.
+    r_sum = 0
     model = build_treelora_vit(
         checkpoint_path=args.model_path,
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_depth=args.lora_depth,
+        r_sum=r_sum,
     )
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
