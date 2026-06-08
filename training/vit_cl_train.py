@@ -56,11 +56,7 @@ from torch.optim import Adam
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append(os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    '..', 'rand_svd_impl',
-))
-from randsvd import rand_svd
+from utils.randsvd import rand_svd
 
 
 # ── Logging tee ───────────────────────────────────────────────────────────────
