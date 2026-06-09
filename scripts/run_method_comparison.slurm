@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --job-name=vit_method_comparison
-#SBATCH --time=24:00:00
+#SBATCH --time=36:00:00
 #SBATCH --open-mode=append
 #SBATCH --output=/data/gmar762/research/continuous_learning/treelora/vit_cl_logs/comparison/slurm_output.log
 #SBATCH --error=/data/gmar762/research/continuous_learning/treelora/vit_cl_logs/comparison/slurm_error.log
@@ -18,8 +18,8 @@ python3 ../scripts/setup.py \
 
 # Comparison of Sketched LoRA (constant adapter cost) vs O-LoRA (linearly growing cost).
 #
-# Both methods use lora_r=8, lora_depth=-1 (all 24 Q+V linears across 12 blocks).
-# lora_depth=-1 maximises the observable FLOP/memory divergence between methods.
+# Both methods use lora_r=8, lora_depth=5 (last 5 transformer blocks, 10 Q+V linears).
+# lora_depth=5 matches the local run configuration.
 #
 # Sketched LoRA: every 2 tasks the per-task adapters are RandSVD-compressed into
 #   a single r_hat-rank summary (svd_rank=8, svd_oversample=4, svd_period=2).
@@ -30,114 +30,136 @@ python3 ../scripts/setup.py \
 # O-LoRA: frozen bank grows by r rows per task.  Forward-pass cost scales as k*r+r
 #   at task k, so 16 → 24 → 32 … rows/layer.
 #
+# Three seeds are run sequentially.  All log/result paths are rooted under
+# seed_${SEED}/ so the runs are fully isolated within a single monolithic job log.
+#
 # Note: the three ImageNet-R variants share the benchmark slug (split-imagenet-r)
 # and would overwrite each other's log files if placed in the same directory.
 # Each variant therefore gets its own --log_dir subdirectory.
 
-# ---------------------------------------------------------------------------
-# Block 1: Sketched LoRA
-# ---------------------------------------------------------------------------
+for SEED in 1 2 3; do
 
-python3 vit_cl_train.py \
-    --model_path    ../PTM/vit-base-patch16-224-in21k \
-    --dataset       cifar100 \
-    --data_root     ../data \
-    --method        sketched_lora \
-    --lora_r        8 \
-    --lora_depth    -1 \
-    --svd_rank      8 \
-    --svd_oversample 4 \
-    --svd_period     2 \
-    --output_dir    ../runs/comparison/sketched_lora/split-cifar-100 \
-    --log_dir       ../vit_cl_logs/comparison/sketched_lora
+    RUN=seed_${SEED}
+    echo "========================================================"
+    echo "  Starting seed ${SEED} / 3   (run dir: ${RUN})"
+    echo "========================================================"
 
-python3 vit_cl_train.py \
-    --model_path       ../PTM/vit-base-patch16-224-in21k \
-    --dataset          imagenet_r \
-    --imagenet_r_tasks 10 \
-    --data_root        ../data \
-    --method           sketched_lora \
-    --lora_r           8 \
-    --lora_depth       -1 \
-    --svd_rank         8 \
-    --svd_oversample   4 \
-    --svd_period       2 \
-    --output_dir       ../runs/comparison/sketched_lora/split-imagenet-r-10t \
-    --log_dir          ../vit_cl_logs/comparison/sketched_lora/imagenet_r_10t
+    # -----------------------------------------------------------------------
+    # Block 1: Sketched LoRA
+    # -----------------------------------------------------------------------
 
-python3 vit_cl_train.py \
-    --model_path       ../PTM/vit-base-patch16-224-in21k \
-    --dataset          imagenet_r \
-    --imagenet_r_tasks 20 \
-    --data_root        ../data \
-    --method           sketched_lora \
-    --lora_r           8 \
-    --lora_depth       -1 \
-    --svd_rank         8 \
-    --svd_oversample   4 \
-    --svd_period       2 \
-    --output_dir       ../runs/comparison/sketched_lora/split-imagenet-r-20t \
-    --log_dir          ../vit_cl_logs/comparison/sketched_lora/imagenet_r_20t
+    python3 vit_cl_train.py \
+        --model_path    ../PTM/vit-base-patch16-224-in21k \
+        --dataset       cifar100 \
+        --data_root     ../data \
+        --method        sketched_lora \
+        --lora_r        8 \
+        --lora_depth    5 \
+        --svd_rank      8 \
+        --svd_oversample 4 \
+        --svd_period     2 \
+        --seed          $SEED \
+        --output_dir    ../runs/comparison/${RUN}/sketched_lora/split-cifar-100 \
+        --log_dir       ../vit_cl_logs/comparison/${RUN}/sketched_lora
 
-python3 vit_cl_train.py \
-    --model_path    ../PTM/vit-base-patch16-224-in21k \
-    --dataset       cub200 \
-    --data_root     ../data \
-    --method        sketched_lora \
-    --lora_r        8 \
-    --lora_depth    -1 \
-    --svd_rank      8 \
-    --svd_oversample 4 \
-    --svd_period     2 \
-    --output_dir    ../runs/comparison/sketched_lora/split-cub-200 \
-    --log_dir       ../vit_cl_logs/comparison/sketched_lora
+    python3 vit_cl_train.py \
+        --model_path       ../PTM/vit-base-patch16-224-in21k \
+        --dataset          imagenet_r \
+        --imagenet_r_tasks 10 \
+        --data_root        ../data \
+        --method           sketched_lora \
+        --lora_r           8 \
+        --lora_depth       5 \
+        --svd_rank         8 \
+        --svd_oversample   4 \
+        --svd_period       2 \
+        --seed             $SEED \
+        --output_dir       ../runs/comparison/${RUN}/sketched_lora/split-imagenet-r-10t \
+        --log_dir          ../vit_cl_logs/comparison/${RUN}/sketched_lora/imagenet_r_10t
 
-# ---------------------------------------------------------------------------
-# Block 2: O-LoRA
-# ---------------------------------------------------------------------------
+    python3 vit_cl_train.py \
+        --model_path       ../PTM/vit-base-patch16-224-in21k \
+        --dataset          imagenet_r \
+        --imagenet_r_tasks 20 \
+        --data_root        ../data \
+        --method           sketched_lora \
+        --lora_r           8 \
+        --lora_depth       5 \
+        --svd_rank         8 \
+        --svd_oversample   4 \
+        --svd_period       2 \
+        --seed             $SEED \
+        --output_dir       ../runs/comparison/${RUN}/sketched_lora/split-imagenet-r-20t \
+        --log_dir          ../vit_cl_logs/comparison/${RUN}/sketched_lora/imagenet_r_20t
 
-python3 vit_cl_train.py \
-    --model_path    ../PTM/vit-base-patch16-224-in21k \
-    --dataset       cifar100 \
-    --data_root     ../data \
-    --method        olora \
-    --lora_r        8 \
-    --lora_depth    -1 \
-    --olora_lambda  0.5 \
-    --output_dir    ../runs/comparison/olora/split-cifar-100 \
-    --log_dir       ../vit_cl_logs/comparison/olora
+    python3 vit_cl_train.py \
+        --model_path    ../PTM/vit-base-patch16-224-in21k \
+        --dataset       cub200 \
+        --data_root     ../data \
+        --method        sketched_lora \
+        --lora_r        8 \
+        --lora_depth    5 \
+        --svd_rank      8 \
+        --svd_oversample 4 \
+        --svd_period     2 \
+        --seed          $SEED \
+        --output_dir    ../runs/comparison/${RUN}/sketched_lora/split-cub-200 \
+        --log_dir       ../vit_cl_logs/comparison/${RUN}/sketched_lora
 
-python3 vit_cl_train.py \
-    --model_path       ../PTM/vit-base-patch16-224-in21k \
-    --dataset          imagenet_r \
-    --imagenet_r_tasks 10 \
-    --data_root        ../data \
-    --method           olora \
-    --lora_r           8 \
-    --lora_depth       -1 \
-    --olora_lambda     0.5 \
-    --output_dir       ../runs/comparison/olora/split-imagenet-r-10t \
-    --log_dir          ../vit_cl_logs/comparison/olora/imagenet_r_10t
+    # -----------------------------------------------------------------------
+    # Block 2: O-LoRA
+    # -----------------------------------------------------------------------
 
-python3 vit_cl_train.py \
-    --model_path       ../PTM/vit-base-patch16-224-in21k \
-    --dataset          imagenet_r \
-    --imagenet_r_tasks 20 \
-    --data_root        ../data \
-    --method           olora \
-    --lora_r           8 \
-    --lora_depth       -1 \
-    --olora_lambda     0.5 \
-    --output_dir       ../runs/comparison/olora/split-imagenet-r-20t \
-    --log_dir          ../vit_cl_logs/comparison/olora/imagenet_r_20t
+    python3 vit_cl_train.py \
+        --model_path    ../PTM/vit-base-patch16-224-in21k \
+        --dataset       cifar100 \
+        --data_root     ../data \
+        --method        olora \
+        --lora_r        8 \
+        --lora_depth    5 \
+        --olora_lambda  0.5 \
+        --seed          $SEED \
+        --output_dir    ../runs/comparison/${RUN}/olora/split-cifar-100 \
+        --log_dir       ../vit_cl_logs/comparison/${RUN}/olora
 
-python3 vit_cl_train.py \
-    --model_path    ../PTM/vit-base-patch16-224-in21k \
-    --dataset       cub200 \
-    --data_root     ../data \
-    --method        olora \
-    --lora_r        8 \
-    --lora_depth    -1 \
-    --olora_lambda  0.5 \
-    --output_dir    ../runs/comparison/olora/split-cub-200 \
-    --log_dir       ../vit_cl_logs/comparison/olora
+    python3 vit_cl_train.py \
+        --model_path       ../PTM/vit-base-patch16-224-in21k \
+        --dataset          imagenet_r \
+        --imagenet_r_tasks 10 \
+        --data_root        ../data \
+        --method           olora \
+        --lora_r           8 \
+        --lora_depth       5 \
+        --olora_lambda     0.5 \
+        --seed             $SEED \
+        --output_dir       ../runs/comparison/${RUN}/olora/split-imagenet-r-10t \
+        --log_dir          ../vit_cl_logs/comparison/${RUN}/olora/imagenet_r_10t
+
+    python3 vit_cl_train.py \
+        --model_path       ../PTM/vit-base-patch16-224-in21k \
+        --dataset          imagenet_r \
+        --imagenet_r_tasks 20 \
+        --data_root        ../data \
+        --method           olora \
+        --lora_r           8 \
+        --lora_depth       5 \
+        --olora_lambda     0.5 \
+        --seed             $SEED \
+        --output_dir       ../runs/comparison/${RUN}/olora/split-imagenet-r-20t \
+        --log_dir          ../vit_cl_logs/comparison/${RUN}/olora/imagenet_r_20t
+
+    python3 vit_cl_train.py \
+        --model_path    ../PTM/vit-base-patch16-224-in21k \
+        --dataset       cub200 \
+        --data_root     ../data \
+        --method        olora \
+        --lora_r        8 \
+        --lora_depth    5 \
+        --olora_lambda  0.5 \
+        --seed          $SEED \
+        --output_dir    ../runs/comparison/${RUN}/olora/split-cub-200 \
+        --log_dir       ../vit_cl_logs/comparison/${RUN}/olora
+
+    echo "  Seed ${SEED} complete."
+
+done
