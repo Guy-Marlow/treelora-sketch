@@ -47,6 +47,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 
 import numpy as np
@@ -1139,6 +1140,7 @@ def main():
              if args.method == 'sketched_lora' else
              f'  reg={args.reg}' if args.reg > 0 else '  reg=disabled'))
 
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
